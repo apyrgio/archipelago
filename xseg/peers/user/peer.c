@@ -438,37 +438,6 @@ int check_ports(struct peerd *peer)
 }
 
 #ifdef MT
-static void* thread_loop(void *arg)
-{
-	struct thread *t = (struct thread *) arg;
-	struct peerd *peer = t->peer;
-	struct xseg *xseg = peer->xseg;
-	xport portno_start = peer->portno_start;
-	xport portno_end = peer->portno_end;
-	pid_t pid =syscall(SYS_gettid);
-	uint64_t loops;
-	uint64_t threshold=1000/(1 + portno_end - portno_start);
-
-	XSEGLOG2(&lc, D, "thread %u\n",  (unsigned int) (t- peer->thread));
-	XSEGLOG2(&lc, I, "Thread %u has tid %u.\n", (unsigned int) (t- peer->thread), pid);
-	xseg_init_local_signal(xseg, peer->portno_start);
-	for (;!(isTerminate() && xq_count(&peer->free_reqs) == peer->nr_ops);) {
-		for(loops =  threshold; loops > 0; loops--) {
-			if (loops == 1)
-				xseg_prepare_wait(xseg, peer->portno_start);
-			if (check_ports(peer, t))
-				loops = threshold;
-		}
-		XSEGLOG2(&lc, I, "Thread %u goes to sleep\n", (unsigned int) (t- peer->thread));
-		xseg_wait_signal(xseg, 10000000UL);
-		xseg_cancel_wait(xseg, peer->portno_start);
-		XSEGLOG2(&lc, I, "Thread %u woke up\n", (unsigned int) (t- peer->thread));
-	}
-	wake_up_next_thread(peer);
-	custom_peer_finalize(peer);
-	return NULL;
-}
-
 void *init_thread_loop(void *arg)
 {
 	struct thread *t = (struct thread *) arg;
@@ -524,6 +493,7 @@ int peerd_start_threads(struct peerd *peer)
 	return 0;
 }
 #endif
+
 
 int defer_request(struct peerd *peer, struct peer_req *pr)
 {
@@ -597,6 +567,7 @@ static int generic_peerd_loop(void *arg)
 	return 0;
 }
 
+#ifndef MT
 static int init_peerd_loop(struct peerd *peer)
 {
 	struct xseg *xseg = peer->xseg;
@@ -607,6 +578,7 @@ static int init_peerd_loop(struct peerd *peer)
 
 	return 0;
 }
+#endif
 
 #ifdef ST_THREADS
 static void * st_peerd_loop(void *peer)
