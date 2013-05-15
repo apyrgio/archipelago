@@ -44,26 +44,72 @@ parse_args() {
 		red_echo "${2} is not a valid bench size option"
 		exit
 	fi
+
+	# ${3} is for cache size and affects cached's number of ops
+	if [[ ${3} = 4 ]]; then
+		NR_OPS=4
+	else
+		NR_OPS=16
+	fi
 }
 
+# This is a bit tricky so an explanation is needed:
+#
+# Each peer command is a single-quoted string with non-evaluated variables. This
+# string will be passed later on to 'eval' in order to start each peer. So,
+# granted this input, we want to print the command that will be fed to eval, but
+# with evaluated variables, wrapped at 54 characters, tabbed and with a back-
+# slash appended to the end of every line.
+#
+# So, if our input was: 'a very nice cow' our output (wrapped at 4 chars) should
+# be:
+#
+# a \
+#     very \
+#     nice \
+#     cow
+#
+# And now to the gritty details on how we do that:
+# 1) First, we append a special character (#) at the end of the peer command.
+# 2) Then, we add at the start a new string ("echo "). This converts the
+#    peer command to an echo command in a string.
+# 2) The echo command is passed to eval. This way, eval will not run the peer
+#    command but will simply evaluate the variables in the string and echo them.
+# 3) Then, we pipe the output to fmt, which wraps it at 54 chars and tabs every
+#    line but the first one. Note that every new line will be printed separately
+# 4) The output is then fed to sed, which appends a back-slash at the end of
+#    each line.
+# 5) Finally, the output is fed for one last time to sed, which removes the
+#    backslash from the last line (the line with the (#) character.
 print_test() {
 	echo ""
 	grn_echo "Summary of Test${I}:"
 	echo "WCP=${WCP} THREADS=${THREADS} IODEPTH=${IODEPTH}"
 	echo "CACHE_SIZE=${CACHE_SIZE}($((CACHE_SIZE * 4))M) BENCH_SIZE=${BENCH_SIZE}"
 	grn_echo "-------------------------------------------------------"
-	echo -e "bench -g posix:apyrgio: -p 2 -tp 0 -v ${VERBOSITY} -op write \\"
-	echo -e "\t--pattern rand -ts ${BENCH_SIZE} --progress yes --seed ${SEED} \\"
-	echo -e "\t--iodepth ${IODEPTH} --verify meta -l /var/log/bench${I}.log"
+	eval "echo "${BENCH_WCOMMAND}""#"" \
+		| fmt -t -w 54 | sed -e 's/$/ \\/g' | sed -e 's/\# \\$//g'
 	echo ""
-	echo -e "cached -g posix:apyrgio: -p 1 -bp 0 -t ${T_CACHED} -v ${VERBOSITY} \\"
-	echo -e "\t-wcp ${WCP} -cs ${CACHE_SIZE} -l /var/log/cached${I}.log"
+	eval "echo "${CACHED_COMMAND}""#"" \
+		| fmt -t -w 54 | sed -e 's/$/ \\/g' | sed -e 's/\# \\$//g'
 	echo ""
-	echo -e "mt-pfiled -g posix:apyrgio: -p 0 -t ${T_MTPF} -v ${VERBOSITY} \\"
-	echo -e "\t--pithos /tmp/pithos1/ --archip /tmp/pithos2/ \\"
-	echo -e "\t-l /var/log/mt-pfiled${I}.log"
+	eval "echo "${MT_PFILED_COMMAND}""#"" \
+		| fmt -t -w 54 | sed -e 's/$/ \\/g' | sed -e 's/\# \\$//g'
 	grn_echo "-------------------------------------------------------"
 	echo ""
+}
+
+init_log() {
+	LOG=/var/log/${1}
+
+	# Truncate previous logs
+	cat /dev/null > $LOG
+
+	echo "" >> $LOG
+	echo "********************" >> $LOG
+	echo "*** TEST STARTED ***" >> $LOG
+	echo "********************" >> $LOG
+	echo "" >> $LOG
 }
 
 ##########################
@@ -132,16 +178,38 @@ killall -9 mt-pfiled 2> /dev/null
 
 if [[ $CLEAN ]]; then exit; fi
 
+##############################
+# Create arguments for peers #
+##############################
+
+BENCH_WCOMMAND='bench -g posix:apyrgio: -p 2 -tp 0 -v ${VERBOSITY} -op write
+			--pattern rand -ts ${BENCH_SIZE} --progress yes --seed ${SEED}
+			--iodepth ${IODEPTH} --verify meta
+			-l /var/log/bench${I}.log'
+
+BENCH_RCOMMAND='bench -g posix:apyrgio: -p 2 -tp 0 -v ${VERBOSITY} -op read
+			--pattern rand -ts ${BENCH_SIZE} --progress yes --seed ${SEED}
+			--iodepth ${IODEPTH} --verify meta
+			-l /var/log/bench${I}.log'
+
+CACHED_COMMAND='cached -g posix:apyrgio: -p 1 -bp 0 -t ${T_CACHED}
+			-v ${VERBOSITY} -wcp ${WCP} -n ${NR_OPS} -cs ${CACHE_SIZE}
+			-l /var/log/cached${I}.log'
+
+MT_PFILED_COMMAND='mt-pfiled -g posix:apyrgio: -p 0 -t ${T_MTPF} -v ${VERBOSITY}
+			--pithos /tmp/pithos1/ --archip /tmp/pithos2/
+			-l /var/log/mt-pfiled${I}.log'
+
 #############
 # Main loop #
 #############
 
 #set -e  #exit on error
 
-for WCP in writeback writethrough; do
-	for THREADS in single multi; do
-		for CACHE_SIZE in 16 64 512; do
-			for IODEPTH in 1 16; do
+for CACHE_SIZE in 4 16 64 512; do
+	for WCP in writeback writethrough; do
+		for IODEPTH in 1 16; do
+			for THREADS in single multi; do
 				for BENCH_SIZE in '1/2' '1+1/2' '2+1/2'; do
 					# Check if user has asked to fast-forward or run a specific
 					# test
@@ -153,42 +221,36 @@ for WCP in writeback writethrough; do
 						fi
 					fi
 
-					# Truncate previous logs
-					cat /dev/null > /var/log/bench${I}.log
-					cat /dev/null > /var/log/cached${I}.log
-					cat /dev/null > /var/log/mt-pfiled${I}.log
+					# Make test-specific initializations
+					init_log bench${I}.log
+					init_log cached${I}.log
+					init_log mt-pfiled${I}.log
 
-					parse_args $THREADS $BENCH_SIZE
+					parse_args $THREADS $BENCH_SIZE $CACHE_SIZE
 					print_test
+
 					read -rsn 1 -p "Press any key to continue..."
 					echo ""
 
 					# Start mt-pfiled
-					mt-pfiled -g posix:apyrgio: -p 0 -t ${T_MTPF} -v ${VERBOSITY} \
-						--pithos /tmp/pithos1/ --archip /tmp/pithos2/ \
-						-l /var/log/mt-pfiled${I}.log &
+					eval ${MT_PFILED_COMMAND}" &"
 					PID_MTPF=$!
 
 					# Start cached
-					cached -g posix:apyrgio: -p 1 -bp 0 -t ${T_CACHED} -v ${VERBOSITY} \
-						-wcp ${WCP} -cs ${CACHE_SIZE} -l /var/log/cached${I}.log &
+					eval ${CACHED_COMMAND}" &"
 					PID_CACHED=$!
 					# Wait a bit to make sure both cached and mt-pfiled is up
 					sleep 1
 
 					# Start bench (write mode)
-					bench -g posix:apyrgio: -p 2 -tp 0 -v ${VERBOSITY} -op write \
-						--pattern rand -ts ${BENCH_SIZE} --progress yes --seed ${SEED} \
-						--iodepth ${IODEPTH} --verify meta -l /var/log/bench${I}.log &
+					eval ${BENCH_WCOMMAND}" &"
 					PID_BENCH=$!
 					echo -n "Waiting for bench to finish writing... "
 					wait $PID_BENCH
 					grn_echo "DONE!"
 
 					# Start bench (read mode)
-					bench -g posix:apyrgio: -p 2 -tp 0 -v ${VERBOSITY} -op read \
-						--pattern rand -ts ${BENCH_SIZE} --progress no --seed ${SEED} \
-						--iodepth ${IODEPTH} --verify meta -l /var/log/bench${I}.log &
+					eval ${BENCH_RCOMMAND}" &"
 					PID_BENCH=$!
 					echo -n "Waiting for bench to finish reading... "
 					wait $PID_BENCH
