@@ -579,7 +579,7 @@ void flush_work(void *wq, void *arg)
 	XSEGLOG2(&lc, I, "Flushing cache entry %p (h: %lu)", ce, cio->h);
 
 	if (wq == &ce->deferred_workq) {
-		XSEGLOG2(&lc, W, "ce %p and pr %p is in deffered workq", ce, pr);
+		XSEGLOG2(&lc, W, "ce %p and pr %p is in deferred workq", ce, pr);
 	}
 
 	if (__is_entry_clean(cached, ce)) {
