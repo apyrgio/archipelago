@@ -49,7 +49,8 @@
 
 #define MAX_ARG_LEN 12
 
-/* bucket states */
+/* bucket statuses */
+#define BUCKET_STATUSES 5
 #define INVALID 0
 #define LOADING 1
 #define VALID   2
@@ -64,7 +65,6 @@
 	(__wcp == WRITETHROUGH	? "writethrough"	:		\
 	__wcp == WRITEBACK	? "writeback"			:		\
 	"undefined")
-
 
 /* cio states */
 #define CIO_FAILED		1
@@ -107,9 +107,8 @@ struct cached {
 struct ce {
 	unsigned char *data;
 	uint32_t *bucket_status;	/* bucket_status of each bucket */
-	struct xwaitq *bucket_waitq;	/* waitq of each bucket */
 	uint32_t status;		/* cache entry status */
-	uint32_t dirty_bc;
+	uint32_t *bucket_status_counters;
 	struct xlock lock;		/* cache entry lock */
 	struct xworkq workq;		/* workq of the cache entry */
 	struct xworkq deferred_workq;		/* async workq for TODO */
@@ -168,24 +167,13 @@ static inline int __is_bucket_readable(uint32_t bucket_status)
 		bucket_status == WRITING);
 }
 
-static inline void __update_dirty_buckets_counter(struct ce *ce,
+static inline void __update_bucket_status_counters(struct ce *ce,
 		uint32_t bucket, uint32_t new_status)
 {
-	struct peerd *peer = ce->pr.peer;
-	struct cached *cached = __get_cached(peer);
 	uint32_t old_status = ce->bucket_status[bucket];
 
-	if (cached->write_policy == WRITETHROUGH)
-		return;
-
-	if (old_status != DIRTY && new_status == DIRTY)
-		ce->dirty_bc++;
-	else if (old_status == DIRTY && new_status != DIRTY)
-		ce->dirty_bc--;
-
-	if (UNLIKELY(ce->dirty_bc > cached->buckets_per_object))
-		XSEGLOG2(&lc, W, "BUG: Dirty buckets counter has illogical value (%lu)",
-				ce->dirty_bc);
+	ce->bucket_status_counters[old_status]--;
+	ce->bucket_status_counters[new_status]++;
 }
 
 static uint32_t __get_bucket(struct cached *cache, uint64_t offset)
@@ -220,12 +208,6 @@ static uint32_t __get_last_dirty(struct ce *ce, uint32_t start, uint32_t limit)
 	return __get_last_per_status(ce, start, limit, DIRTY);
 }
 
-static int is_not_loading(void *arg)
-{
-	uint32_t *bucket_status = (uint32_t *)arg;
-	return (*bucket_status != LOADING);
-}
-
 static int cache_not_full(void *arg)
 {
 	struct cached *cached = (struct cached *)arg;
@@ -234,7 +216,7 @@ static int cache_not_full(void *arg)
 
 static void __set_bucket_status(struct ce *ce, uint32_t b, uint32_t new_status)
 {
-	__update_dirty_buckets_counter(ce, b, new_status);
+	__update_bucket_status_counters(ce, b, new_status);
 	ce->bucket_status[b] = new_status;
 }
 
@@ -247,14 +229,31 @@ static void __set_bucket_status_range(struct ce *ce, uint32_t start,
 		__set_bucket_status(ce, i, new_status);
 }
 
-static int __is_entry_dirty(struct cached *cached, struct ce *ce)
+static void __print_bc(uint32_t *bc) {
+	XSEGLOG("Bucket statuses:\n"
+			"Loading %u,\n"
+			"Writing: %u,\n"
+			"Dirty %u,\n"
+			"Valid %u,\n"
+			"Invalid %u",
+			bc[LOADING], bc[WRITING], bc[DIRTY], bc[VALID], bc[INVALID]);
+}
+
+static int __is_entry_clean(struct cached *cached, struct ce *ce)
 {
+	uint32_t *bc = ce->bucket_status_counters;
+	struct cache_io *ce_cio = __get_cache_io(&ce->pr);
+
 	if (cached->write_policy == WRITETHROUGH ||
 			ce->status == CE_INVALIDATED ||
-			ce->dirty_bc == 0)
-		return 0;
+			bc[DIRTY] == 0)
+		return 1;
 
-	return 1;
+	if (ce->status == CE_FLUSHING || ce->status == CE_DELETING)
+		XSEGLOG2(&lc, I, "ce %p has pending work to do (status: %lu, "
+				"pending_reqs: %u)", ce, ce->status, ce_cio->pending_reqs);
+
+	return 0;
 }
 
 /*
@@ -399,13 +398,14 @@ static void cached_complete(struct peerd *peer, struct peer_req *pr)
 {
 	struct cached *cached = __get_cached(peer);
 	struct cache_io *cio = __get_cache_io(pr);
+	xcache_handler h = cio->h;
 
-	XSEGLOG2(&lc, I, "Completing pr %p (h: %lu)", pr, cio->h);
+	XSEGLOG2(&lc, I, "Completing pr %p (h: %lu)", pr, h);
 	if (__can_respond_request(peer, pr))
 		complete(peer, pr);
 
-	if (__is_handler_valid(cio->h))
-		xcache_put(cached->cache, cio->h);
+	if (__is_handler_valid(h))
+		xcache_put(cached->cache, h);
 }
 
 static void cached_fake_complete(struct peerd *peer, struct peer_req *pr)
@@ -461,7 +461,7 @@ static int rw_range(struct peerd *peer, struct peer_req *pr, uint32_t op,
 	/* Allocate request */
 	req = xseg_get_request(xseg, srcport, dstport, X_ALLOC);
 	if (!req) {
-		XSEGLOG2(&lc, W, "Cannot get request\n");
+		XSEGLOG2(&lc, W, "Cannot get request");
 		return -1;
 	}
 	req->size = __calculate_size(cached, start, end);
@@ -478,7 +478,7 @@ static int rw_range(struct peerd *peer, struct peer_req *pr, uint32_t op,
 	/* Prepare request */
 	r = xseg_prep_request(xseg, req, targetlen, req->size);
 	if (r < 0) {
-		XSEGLOG2(&lc, W, "Cannot prepare request! (%lu, %llu)\n",
+		XSEGLOG2(&lc, W, "Cannot prepare request! (%lu, %llu)",
 				targetlen, (unsigned long long)req->size);
 		goto put_xseg_request;
 	}
@@ -494,14 +494,14 @@ static int rw_range(struct peerd *peer, struct peer_req *pr, uint32_t op,
 	/* Set request data */
 	r = xseg_set_req_data(xseg, req, pr);
 	if (r < 0) {
-		XSEGLOG2(&lc, W, "Cannot set request data\n");
+		XSEGLOG2(&lc, W, "Cannot set request data");
 		goto put_xseg_request;
 	}
 
 	/* Submit request */
 	p = xseg_submit(xseg, req, srcport, X_ALLOC);
 	if (p == NoPort) {
-		XSEGLOG2(&lc, W, "Cannot submit request\n");
+		XSEGLOG2(&lc, W, "Cannot submit request");
 		goto out_unset_data;
 	}
 
@@ -513,7 +513,7 @@ out_unset_data:
 	xseg_set_req_data(xseg, req, NULL);
 put_xseg_request:
 	if (xseg_put_request(xseg, req, srcport))
-		XSEGLOG2(&lc, W, "Cannot put request\n");
+		XSEGLOG2(&lc, W, "Cannot put request");
 	return -1;
 }
 
@@ -578,7 +578,11 @@ void flush_work(void *wq, void *arg)
 
 	XSEGLOG2(&lc, I, "Flushing cache entry %p (h: %lu)", ce, cio->h);
 
-	if (!__is_entry_dirty(cached, ce)) {
+	if (wq == &ce->deferred_workq) {
+		XSEGLOG2(&lc, W, "ce %p and pr %p is in deffered workq", ce, pr);
+	}
+
+	if (__is_entry_clean(cached, ce)) {
 		cached_complete(peer, pr);
 		return;
 	}
@@ -588,8 +592,14 @@ void flush_work(void *wq, void *arg)
 	 * job, it will be signalled immediately
 	 */
 	if (ce->status == CE_DELETING || ce->status == CE_FLUSHING) {
-		XSEGLOG2(&lc, I, "Blocker cannot receive flush request "
-				"(ce->status: %lu)", ce->status);
+		XSEGLOG2(&lc, W, "Blocker cannot receive flush request "
+				"(ce: %p, ce->status: %lu)", ce, ce->status);
+		if (wq == &ce->deferred_workq) {
+			XSEGLOG2(&lc, W, "Cannot enqueue to deferred workq of ce %p", ce);
+			xworkq_enqueue(&ce->workq, flush_work, (void *)pr);
+			xworkq_enqueue(&cached->workq, signal_workq, (void *)&ce->workq);
+			return;
+		}
 		if (xworkq_enqueue(&ce->deferred_workq, flush_work, (void *)pr) < 0) {
 			cio->state = CIO_FAILED;
 			XSEGLOG2(&lc, E, "Error: cannot enqueue request");
@@ -609,14 +619,14 @@ out:
 		XSEGLOG2(&lc, D, "Sent %lu flush request(s) to blocker",
 				cio->pending_reqs);
 	} else {
-		XSEGLOG2(&lc, W, "BUG: Entry was(?) dirty but flush was not necessary");
+		XSEGLOG2(&lc, W, "BUG: Entry (ce :%p) was(?) dirty but flush was not "
+				"necessary", ce);
 		cached_complete(peer, pr);
 	}
 }
 
 void *init_node(void *c, void *xh)
 {
-	int i;
 	struct peerd *peer = (struct peerd *)c;
 	xcache_handler h = *(xcache_handler *)(xh);
 	struct cached *cached = peer->priv;
@@ -632,19 +642,15 @@ void *init_node(void *c, void *xh)
 	xlock_release(&ce->lock);
 	ce->data = malloc(sizeof(unsigned char) * cached->object_size);
 	ce->bucket_status = malloc(sizeof(uint32_t) * cached->buckets_per_object);
-	ce->bucket_waitq = malloc(sizeof(struct xwaitq) * cached->buckets_per_object);
+	ce->bucket_status_counters = malloc(sizeof(uint32_t) * BUCKET_STATUSES);
 	ce->pr.priv = malloc(sizeof(struct cache_io));
 
-	if (!ce->data || !ce->bucket_status || !ce->bucket_waitq || !ce->pr.priv)
+	if (!ce->data || !ce->bucket_status || !ce->bucket_status_counters || !ce->pr.priv)
 		goto ce_fields_fail;
 
 	ce->pr.peer = peer;
 	ce->pr.portno = peer->portno_start;
 
-	for (i = 0; i < cached->buckets_per_object; i++) {
-		xwaitq_init(&ce->bucket_waitq[i], is_not_loading,
-				&ce->bucket_status[i], XWAIT_SIGNAL_ONE);
-	}
 	ce_cio = (struct cache_io *)ce->pr.priv;
 	ce_cio->h = h;
 
@@ -656,7 +662,7 @@ void *init_node(void *c, void *xh)
 ce_fields_fail:
 	free(ce->data);
 	free(ce->bucket_status);
-	free(ce->bucket_waitq);
+	free(ce->bucket_status_counters);
 	free(ce);
 ce_fail:
 	perror("malloc");
@@ -675,17 +681,24 @@ int on_init(void *c, void *e)
 	struct cached *cached = peer->priv;
 	struct ce *ce = (struct ce *)e;
 	struct cache_io *ce_cio = ce->pr.priv;
+	uint32_t *bc = ce->bucket_status_counters;
 
 	XSEGLOG2(&lc, I, "Initializing cache entry %p (ce_cio: %p, h: %lu)",
 			ce, ce_cio, ce_cio->h);
 
 	ce->status = CE_READY;
 	ce_cio->state = CIO_ACCEPTED;
-	ce->dirty_bc = 0;
 	ce_cio->pending_reqs = 0;
 
+	/*
+	 * We don't use __set_bucket_status_range here, since previous bucket
+	 * statuses will affect our counters
+	 */
+	for (i = 0; i < BUCKET_STATUSES; i++)
+		bc[i] = 0;
 	for (i = 0; i < cached->buckets_per_object; i++)
 		ce->bucket_status[i] = INVALID;
+	bc[INVALID] = cached->buckets_per_object;
 
 	return 0;
 }
@@ -695,7 +708,7 @@ void on_reinsert(void *c, void *e)
 	struct ce *ce = (struct ce *)e;
 	struct cache_io *ce_cio = ce->pr.priv;
 
-	XSEGLOG2(&lc, I, "Reinserted cache entry %p (h: %lu)", ce, ce_cio->h);
+	XSEGLOG2(&lc, I, "Re-inserted cache entry %p (h: %lu)", ce, ce_cio->h);
 }
 
 int on_evict(void *c, void *e)
@@ -707,6 +720,15 @@ int on_evict(void *c, void *e)
 	return 0;
 }
 
+int post_evict(void *c, void *e)
+{
+	struct ce *ce = (struct ce *)e;
+	struct cache_io *ce_cio = ce->pr.priv;
+
+	XSEGLOG2(&lc, I, "Moving cache entry %p (h: %lu) in rm entries", ce, ce_cio->h);
+	return 1;
+}
+
 int on_finalize(void *c, void *e)
 {
 	struct peerd *peer = (struct peerd *)c;
@@ -716,7 +738,7 @@ int on_finalize(void *c, void *e)
 
 	XSEGLOG2(&lc, I, "Finalizing cache entry %p (h: %lu)", ce, ce_cio->h);
 
-	if (!__is_entry_dirty(cached, ce))
+	if (__is_entry_clean(cached, ce))
 		return 0;
 
 	xcache_get(cached->cache, ce_cio->h);
@@ -747,11 +769,6 @@ void on_free(void *c, void *e)
 
 	XSEGLOG2(&lc, I, "Freeing cache entry %p (ce_cio: %p, h: %lu)",
 			ce, ce_cio, ce_cio->h);
-
-	if (ce->dirty_bc > 0)
-		XSEGLOG2(&lc, W, "BUG: Dirty buckets counter is %lu", ce->dirty_bc);
-	if (ce_cio->pending_reqs > 0)
-		XSEGLOG2(&lc, W, "BUG: There are %lu pending reqs", ce_cio->pending_reqs);
 	/*
 	 * Doesn't matter if signal can't be enqueued, pending_waitq will be
 	 * signalled eventually.
@@ -763,7 +780,7 @@ struct xcache_ops c_ops = {
 	.on_init = on_init,
 	.on_evict = on_evict,
 	.on_finalize = on_finalize,
-	.post_evict = NULL,
+	.post_evict = post_evict,
 	.on_reinsert = on_reinsert,
 	.on_put = NULL,
 	.on_free  = on_free,
@@ -822,7 +839,7 @@ static void handle_read(void *q, void *arg)
 		XSEGLOG2(&lc, W, "Request exceeds object's bucket range (%lu)", end_bucket);
 		end_bucket = cached->buckets_per_object;
 	}
-	XSEGLOG2(&lc, D, "Start: %lu, end %lu", start_bucket, end_bucket);
+	XSEGLOG2(&lc, D, "Start: %lu, end %lu for ce: %p", start_bucket, end_bucket);
 
 	/* Issue read requests to blocker for invalid buckets */
 	for (i = start_bucket; i <= end_bucket; i++) {
@@ -849,8 +866,8 @@ static void handle_read(void *q, void *arg)
 		}
 	}
 
-	XSEGLOG2(&lc, D, "Loading buckets: %lu, pending requests: %lu",
-			loading_buckets, pending_requests);
+	XSEGLOG2(&lc, D, "Loading buckets: %lu, pending requests: %lu (ce: %p)",
+			loading_buckets, pending_requests, ce);
 
 	/* FIXME: Handle this correctly */
 	if (!pending_requests && loading_buckets) {
@@ -882,6 +899,7 @@ out:
 			cached_complete(peer, pr);
 		}
 	}
+	XSEGLOG2(&lc, D, "Finished for %p (h: %lu, pr: %p)", ce, cio->h, pr);
 }
 
 /*
@@ -971,9 +989,9 @@ static void handle_write(void *q, void *arg)
 		if (forward_req(peer, pr, pr->req) < 0) {
 			XSEGLOG2(&lc, E, "Couldn't forward write request %p to blocker", req);
 			cio->state = CIO_FAILED;
-		} else {
-			cio->pending_reqs++;
+			goto out;
 		}
+		cio->pending_reqs++;
 	} else if (cached->write_policy == WRITEBACK) {
 		req_data = xseg_get_data(peer->xseg, pr->req);
 		memcpy(ce->data + req->offset, req_data, req->size);
@@ -994,7 +1012,8 @@ out:
 		else
 			cached_complete(peer, pr);
 	}
-	return;
+
+	XSEGLOG2(&lc, D, "Finished for %p (h: %lu, pr: %p)", ce, cio->h, pr);
 }
 
 /*
@@ -1034,7 +1053,7 @@ static void handle_readwrite(void *q, void *arg)
 	target = xseg_get_target(peer->xseg, req);
 	strncpy(name, target, req->targetlen);
 	name[req->targetlen] = 0;
-	XSEGLOG2(&lc, D, "Target is %s", name);
+	XSEGLOG2(&lc, D, "Target is %s (pr: %p)", name, pr);
 
 	/*
 	 * TODO: In case our target is in "rm_entries", you must allocate a cache
@@ -1048,7 +1067,8 @@ static void handle_readwrite(void *q, void *arg)
 
 		h = xcache_alloc_init(cached->cache, name);
 		if (!__is_handler_valid(h)) {
-			XSEGLOG2(&lc, D, "Could not allocate cache entry");
+			XSEGLOG2(&lc, I, "Could not allocate cache entry for %s (pr: %p)",
+					name, pr);
 			cio->work.job_fn = handle_readwrite;
 			cio->work.job = (void *)pr;
 			r = xwaitq_enqueue(&cached->pending_waitq, &cio->work);
@@ -1056,7 +1076,7 @@ static void handle_readwrite(void *q, void *arg)
 		}
 
 		nh = xcache_insert(cached->cache, h);
-		if (nh == NoEntry) {
+		if (!__is_handler_valid(nh)) {
 			XSEGLOG2(&lc, E, "Could not insert cache entry");
 			xcache_free_new(cached->cache, h);
 			r = -1;
@@ -1145,8 +1165,8 @@ static void complete_read(void *q, void *arg)
 	int success;
 
 	XSEGLOG2(&lc, D, "Started");
-	XSEGLOG2(&lc, D, "Target: %s. Serviced vs total: %lu/%lu",
-			xseg_get_target(peer->xseg, req), req->serviced, req->size);
+	XSEGLOG2(&lc, D, "Target: %s (ce: %p). Serviced vs total: %lu/%lu",
+			xseg_get_target(peer->xseg, req), ce, req->serviced, req->size);
 
 	/*
 	 * Synchronize pending_reqs of the cache_io here, since each cache_io
@@ -1216,14 +1236,14 @@ out:
 		if (ce->status == CE_INVALIDATED)
 			cached_fake_complete(peer, pr);
 		else if (cio->state == CIO_READING)
-			xworkq_enqueue(&ce->workq, handle_read, (void *)pr);
+			handle_read((void *)&ce->workq, (void *)pr);
 		else if (cio->state == CIO_WRITING)
-			xworkq_enqueue(&ce->workq, handle_write, (void *)pr);
+			handle_write((void *)&ce->workq, (void *)pr);
 		else if (cio->state == CIO_FAILED)
 			cached_fail(peer, pr);
 	}
 
-	XSEGLOG2(&lc, D, "Finished\n");
+	XSEGLOG2(&lc, D, "Finished");
 }
 
 //WORK
