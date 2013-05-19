@@ -112,6 +112,20 @@ init_log() {
 	echo "" >> $LOG
 }
 
+nuke_xseg() {
+	# Clear previous tries
+	killall -9 bench 2> /dev/null
+	killall -9 cached 2> /dev/null
+	killall -9 mt-pfiled 2> /dev/null
+
+	# Re-build segment
+	xseg posix:apyrgio:16:1024:12 destroy create
+	xseg posix:apyrgio: set-next 2 1
+	xseg posix:apyrgio: set-next 3 1
+	xseg posix:apyrgio: set-next 4 1
+	xseg posix:apyrgio: set-next 5 1
+}
+
 ##########################
 # Script initializations #
 ##########################
@@ -164,17 +178,8 @@ find /tmp/pithos1/ -name "*" -exec rm -rf {} \;
 find /tmp/pithos2/ -name "*" -exec rm -rf {} \;
 mkdir /tmp/pithos1/ /tmp/pithos2/
 
-# Re-build segment
-xseg posix:apyrgio:16:1024:12 destroy create
-xseg posix:apyrgio: set-next 2 1
-xseg posix:apyrgio: set-next 3 1
-xseg posix:apyrgio: set-next 4 1
-xseg posix:apyrgio: set-next 5 1
-
-# Clear previous tries
-killall -9 bench 2> /dev/null
-killall -9 cached 2> /dev/null
-killall -9 mt-pfiled 2> /dev/null
+# Call wipe_seg to clear the segment and kill all peer processes
+nuke_xseg
 
 if [[ $CLEAN ]]; then exit; fi
 
@@ -256,9 +261,9 @@ for CACHE_SIZE in 4 16 64 512; do
 					wait $PID_BENCH
 					grn_echo "DONE!"
 
-					# Kill rest of processes
-					kill $PID_CACHED
-					kill $PID_MTPF
+					# Since cached's termination has not been solved yet, we
+					# have to resort in weapons of mass destruction
+					nuke_xseg
 				done
 			done
 		done
