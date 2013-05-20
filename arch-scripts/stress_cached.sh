@@ -5,17 +5,37 @@
 #####################
 
 usage() {
-	echo "Usage: ./test_cached [-test <i>] [-ff <i>] [-v <i>] [-c] [-h]"
-	echo "Options: -test <i>: fast-forward to test <i>, run it and exit"
-	echo "         -ff <i>:   fast-forward to test <i>, run every text from here"
-	echo "         -v <i>:    set verbosity level to <i>"
-	echo "         -c:        just clean the segment"
-	echo "         -h:        Print this message"
+	echo "Usage: ./stress_cached [-test <i>] [-ff <i>] [until <i>] [seed <n>]"
+	echo "                     [-v <i>] [-y] [-c] [-h]"
 	echo ""
-	echo "An easy way to check out the output would be to start 3 terminals and"
-	echo "simply have them do: tail -F /var/log/cached* (or bench*, mt-pfiled*)"
-	echo "Thus, when a file is rm'ed or a new file with the same prefix has "
-	echo "been added, tail will read it and you won't have to do anything."
+	echo "Options: -test <i>:  run only test <i>"
+	echo "         -ff <i>:    fast-forward to test <i>, run every test from "
+	echo "                     there on"
+	echo "         -until <i>: run every test until AND test <i>"
+	echo "         -seed <n>:  use <n> as a seed for the test (9-digits only)"
+	echo "         -v <l>:     set verbosity level to <l>"
+	echo "         -y:         do not wait between tests"
+	echo "         -c:         just clean the segment"
+	echo "         -h:         rint this message"
+	echo ""
+	echo "---------------------------------------------------------------------"
+	echo "Additional info:"
+	echo ""
+	echo "* None of the above options needs to be used. By default,"
+	echo "  stress_cached will iterate the list of tests and pause between "
+	echo "  each one so that the user can take a look at the logs."
+	echo ""
+	echo "* If the user has not given a seed, stress_cached will pick a random "
+	echo "  seed value."
+	echo ""
+	echo "* The -ff and -until options can be used together to run tests"
+	echo "  within a range"
+	echo ""
+	echo "* An easy way to check out the output would be to start 3 terminals"
+	echo "  and simply have them do: tail -F /var/log/cached* (or bench*,"
+	echo "  mt-pfiled*). Thus, when a file is rm'ed or a new file with the same"
+	echo "  prefix has been added, tail will read it and you won't have to do"
+	echo "  anything."
 }
 
 parse_args() {
@@ -53,6 +73,21 @@ parse_args() {
 	fi
 }
 
+# Create a random (or user-provided) 9-digit seed
+create_seed() {
+	# if $1 is not empty then the user has provided a seed value
+	if [[ -n $1 ]]; then
+		SEED=$(($1 % 1000000000))
+		if [[ $1 != $SEED ]]; then
+			red_echo "Provided seed was larger than expected:"
+			red_echo "\tOnly its first 9 digits will be used."
+		fi
+		return
+	fi
+	SEED=$(od -vAn -N4 -tu4 < /dev/urandom)
+	SEED=$(($SEED % 1000000000))
+}
+
 # This is a bit tricky so an explanation is needed:
 #
 # Each peer command is a single-quoted string with non-evaluated variables. This
@@ -84,10 +119,10 @@ parse_args() {
 print_test() {
 	echo ""
 	grn_echo "Summary of Test${I}:"
-	echo "WCP=${WCP} THREADS=${THREADS} IODEPTH=${IODEPTH}"
+	echo "WCP=${WCP} THREADS=${THREADS} IODEPTH=${IODEPTH} SEED=${SEED}"
 	echo "CACHE_SIZE=${CACHE_SIZE}($((CACHE_SIZE * 4))M) BENCH_SIZE=${BENCH_SIZE}"
 	grn_echo "-------------------------------------------------------"
-	eval "echo "${BENCH_WCOMMAND}""#"" \
+	eval "echo "${BENCH_COMMAND}""#"" \
 		| fmt -t -w 54 | sed -e 's/$/ \\/g' | sed -e 's/\# \\$//g'
 	echo ""
 	eval "echo "${CACHED_COMMAND}""#"" \
@@ -106,17 +141,32 @@ init_log() {
 	cat /dev/null > $LOG
 
 	echo "" >> $LOG
-	echo "********************" >> $LOG
-	echo "*** TEST STARTED ***" >> $LOG
-	echo "********************" >> $LOG
+	blu_echo "******************" >> $LOG
+	blu_echo " TEST ${I} STARTED" >> $LOG
+	blu_echo "******************" >> $LOG
 	echo "" >> $LOG
 }
 
+# The following two functions manipulate the stdout and stderr.
+# They must always be used in pairs.
+suppress_output() {
+	exec 11>&1
+	exec 22>&2
+	exec 1>/dev/null 2>/dev/null
+}
+
+restore_output() {
+	exec 1>&11 11>&-
+	exec 2>&22 22>&-
+}
+
 nuke_xseg() {
+	suppress_output
+
 	# Clear previous tries
-	killall -9 bench 2> /dev/null
-	killall -9 cached 2> /dev/null
-	killall -9 mt-pfiled 2> /dev/null
+	killall -9 bench
+	killall -9 cached
+	killall -9 mt-pfiled
 
 	# Re-build segment
 	xseg posix:apyrgio:16:1024:12 destroy create
@@ -124,6 +174,8 @@ nuke_xseg() {
 	xseg posix:apyrgio: set-next 3 1
 	xseg posix:apyrgio: set-next 4 1
 	xseg posix:apyrgio: set-next 5 1
+
+	restore_output
 }
 
 ##########################
@@ -141,21 +193,32 @@ source $ARCH_SCRIPTS/init.sh
 #############
 
 VERBOSITY=1
-SEED=666
 I=0
+WAIT=true
+BENCH_OP=write
 
+# Remember, in Bash 0 is true and 1 is false
 while [[ -n $1 ]]; do
 	if [[ $1 = '-ff' ]]; then
 		shift
 		FF=0
-		LIMIT=${1}
+		FLIMIT=$1
 	elif [[ $1 = '-test' ]]; then
 		shift
 		TEST=0
-		LIMIT=${1}
+		TLIMIT=$1
+	elif [[ $1 = '-until' ]]; then
+		shift
+		UNTIL=0
+		ULIMIT=$1
+	elif [[ $1 = '-seed' ]]; then
+		shift
+		SEED=$1
 	elif [[ $1 = '-v' ]]; then
 		shift
 		VERBOSITY=$1
+	elif [[ $1 = '-y' ]]; then
+		WAIT=false
 	elif [[ $1 = '-c' ]]; then
 		CLEAN=0
 	elif [[ $1 = '-h' ]]; then
@@ -174,11 +237,13 @@ done
 ############################
 
 # Delete mt-pfiled files
+suppress_output
 find /tmp/pithos1/ -name "*" -exec rm -rf {} \;
 find /tmp/pithos2/ -name "*" -exec rm -rf {} \;
 mkdir /tmp/pithos1/ /tmp/pithos2/
+restore_output
 
-# Call wipe_seg to clear the segment and kill all peer processes
+# Call nuke_xseg to clear the segment and kill all peer processes
 nuke_xseg
 
 if [[ $CLEAN ]]; then exit; fi
@@ -187,13 +252,10 @@ if [[ $CLEAN ]]; then exit; fi
 # Create arguments for peers #
 ##############################
 
-BENCH_WCOMMAND='bench -g posix:apyrgio: -p 2 -tp 0 -v ${VERBOSITY} -op write
-			--pattern rand -ts ${BENCH_SIZE} --progress yes --seed ${SEED}
-			--iodepth ${IODEPTH} --verify meta
-			-l /var/log/bench${I}.log'
+create_seed $SEED
 
-BENCH_RCOMMAND='bench -g posix:apyrgio: -p 2 -tp 0 -v ${VERBOSITY} -op read
-			--pattern rand -ts ${BENCH_SIZE} --progress yes --seed ${SEED}
+BENCH_COMMAND='bench -g posix:apyrgio: -p 2 -tp 0 -v ${VERBOSITY} --seed ${SEED}
+			-op ${BENCH_OP} --pattern rand -ts ${BENCH_SIZE} --progress yes
 			--iodepth ${IODEPTH} --verify meta
 			-l /var/log/bench${I}.log'
 
@@ -219,10 +281,13 @@ for CACHE_SIZE in 4 16 64 512; do
 					# Check if user has asked to fast-forward or run a specific
 					# test
 					I=$(( $I+1 ))
-					if [[ ($TEST || $FF) ]]; then
-						if [[ $I -lt $LIMIT ]]; then continue
-						elif [[ $I -eq $LIMIT ]]; then FF=1
-						elif [[ ($I -gt $LIMIT && $TEST) ]]; then exit
+					if [[ $TEST ]]; then
+						if [[ $I -lt $TLIMIT ]]; then continue
+						elif [[ $I -gt $TLIMIT ]]; then exit
+						fi
+					elif [[ $FF ]]; then
+						if [[ $I -lt $FLIMIT ]]; then continue
+						elif [[ $I -eq $FLIMIT ]]; then FF=1
 						fi
 					fi
 
@@ -234,7 +299,9 @@ for CACHE_SIZE in 4 16 64 512; do
 					parse_args $THREADS $BENCH_SIZE $CACHE_SIZE
 					print_test
 
-					read -rsn 1 -p "Press any key to continue..."
+					if [[ $WAIT == true ]]; then
+						read -rsn 1 -p "Press any key to continue..."
+					fi
 					echo ""
 
 					# Start mt-pfiled
@@ -248,22 +315,26 @@ for CACHE_SIZE in 4 16 64 512; do
 					sleep 1
 
 					# Start bench (write mode)
-					eval ${BENCH_WCOMMAND}" &"
+					BENCH_OP=write
+					eval ${BENCH_COMMAND}" &"
 					PID_BENCH=$!
 					echo -n "Waiting for bench to finish writing... "
 					wait $PID_BENCH
 					grn_echo "DONE!"
 
 					# Start bench (read mode)
-					eval ${BENCH_RCOMMAND}" &"
+					BENCH_OP=read
+					eval ${BENCH_COMMAND}" &"
 					PID_BENCH=$!
 					echo -n "Waiting for bench to finish reading... "
 					wait $PID_BENCH
 					grn_echo "DONE!"
 
 					# Since cached's termination has not been solved yet, we
-					# have to resort in weapons of mass destruction
+					# have to resort to weapons of mass destruction
 					nuke_xseg
+
+					if [[ ($UNTIL && $I -eq $ULIMIT) ]]; then exit; fi
 				done
 			done
 		done
