@@ -144,7 +144,7 @@ create_seed() {
 #    backslash from the last line (the line with the (#) character.
 print_test() {
 	echo ""
-	grn_echo "Summary of Test${I}:"
+	grn_echo "Summary of Test ${I}:"
 	echo "WCP=${WCP} THREADS=${THREADS} IODEPTH=${IODEPTH} SEED=${SEED}"
 	echo "CACHE_SIZE=${CACHE_SIZE}($((CACHE_SIZE * 4))M) BENCH_SIZE=${BENCH_SIZE}"
 	grn_echo "-------------------------------------------------------"
@@ -205,9 +205,25 @@ nuke_xseg() {
 
 	# Re-build segment
 	xseg posix:apyrgio:16:1024:12 destroy create
-	for P in $BENCH_PORTS; do
-		xseg posix:apyrgio: set-next ${P} 1
-	done
+#	for P in $BENCH_PORTS; do
+#		xseg posix:apyrgio: set-next ${P} 1
+#	done
 
 	restore_output
+}
+
+read_prompt () {
+	while true; do
+		read -rn 1 -p "Run this test? [Y]es,[S]kip,[Q]uit: "
+		echo ""
+		if [[ ( -z $REPLY || $REPLY =~ ^[Yy]$ ) ]]; then
+			SKIP=1
+			break
+		elif [[ $REPLY =~ ^[Ss]$ ]]; then
+			SKIP=0
+			break
+		elif [[ $REPLY =~ ^[Qq]$ ]]; then
+			exit
+		fi
+	done
 }

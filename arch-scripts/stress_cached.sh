@@ -18,7 +18,7 @@ source $ARCH_SCRIPTS/stress_cached_h.sh
 VERBOSITY=1
 BENCH_INSTANCES=1
 I=0
-WAIT=true
+WAIT=0
 BENCH_OP=write
 
 # Remember, in Bash 0 is true and 1 is false
@@ -45,7 +45,7 @@ while [[ -n $1 ]]; do
 		shift
 		VERBOSITY=$1
 	elif [[ $1 = '-y' ]]; then
-		WAIT=false
+		WAIT=1
 	elif [[ $1 = '-c' ]]; then
 		CLEAN=0
 	elif [[ $1 = '-h' ]]; then
@@ -89,7 +89,7 @@ if [[ $CLEAN ]]; then exit; fi
 create_seed $SEED
 
 BENCH_COMMAND='bench -g posix:apyrgio: -p ${P} -tp 0
-			-v ${VERBOSITY} --seed ${SEED} -op ${BENCH_OP} --pattern seq
+			-v ${VERBOSITY} --seed ${SEED} -op ${BENCH_OP} --pattern rand
 			-ts ${BENCH_SIZE} --progress yes --iodepth ${IODEPTH} --verify meta
 			-l /var/log/bench${I}.log'
 
@@ -114,7 +114,9 @@ for CACHE_SIZE in 4 16 64 512; do
 					# Check if user has asked to fast-forward or run a specific
 					# test
 					I=$(( $I+1 ))
-					if [[ $TEST ]]; then
+
+					if [[ ($UNTIL && $I -gt $ULIMIT) ]]; then exit
+					elif [[ $TEST ]]; then
 						if [[ $I -lt $TLIMIT ]]; then continue
 						elif [[ $I -gt $TLIMIT ]]; then exit
 						fi
@@ -132,10 +134,10 @@ for CACHE_SIZE in 4 16 64 512; do
 					parse_args $THREADS $BENCH_SIZE $CACHE_SIZE
 					print_test
 
-					if [[ $WAIT == true ]]; then
-						read -rsn 1 -p "Press any key to continue..."
+					if [[ $WAIT == 0 ]]; then
+						read_prompt
+						if [[ $SKIP == 0 ]]; then continue; fi
 					fi
-					echo ""
 
 					# Start mt-pfiled
 					eval ${MT_PFILED_COMMAND}" &"
@@ -174,8 +176,6 @@ for CACHE_SIZE in 4 16 64 512; do
 					# Since cached's termination has not been solved yet, we
 					# have to resort to weapons of mass destruction
 					nuke_xseg
-
-					if [[ ($UNTIL && $I -eq $ULIMIT) ]]; then exit; fi
 				done
 			done
 		done
