@@ -205,9 +205,9 @@ nuke_xseg() {
 
 	# Re-build segment
 	xseg posix:apyrgio:16:1024:12 destroy create
-#	for P in $BENCH_PORTS; do
-#		xseg posix:apyrgio: set-next ${P} 1
-#	done
+	for P in $BENCH_PORTS; do
+		xseg posix:apyrgio: set-next ${P} 1
+	done
 
 	restore_output
 }
