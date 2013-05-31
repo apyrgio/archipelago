@@ -94,6 +94,9 @@ int addto_pollfds(struct pollfd *pfds, int fd, short flags);
 int synapsed_init_local_signal(struct peerd *peer, sigset_t *oldset);
 
 void create_synapsed_header(struct synapsed_header *sh, struct xseg_request *req);
+int recv_synapsed_header(int fd, struct synapsed_header *sh);
+int send_data(int fd, struct synapsed_header *sh, char *data, char *target);
+int recv_data(int fd, struct synapsed_header *sh, char *data, char *target);
 
 int accept_remote(struct synapsed *syn);
 int connect_to_remote(struct synapsed *syn, struct sockaddr_in *raddr_in);

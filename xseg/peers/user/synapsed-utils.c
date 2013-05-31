@@ -210,6 +210,61 @@ void create_synapsed_header(struct synapsed_header *sh, struct xseg_request *req
 	sh->serviced = req->serviced;
 }
 
+void read_synapsed_header(struct synapsed_header *sh, struct xseg_request *req)
+{
+	req = sh->req;
+	req->dst_portno = sh->xseg_dst_portno;
+	req->op = sh->op;
+	req->state = sh->state;
+	req->flags = sh->flags;
+	req->serviced = sh->serviced;
+	req->datalen = sh->datalen;
+	req->targetlen = sh->targetlen;
+	req->size = sh->size;
+	req->serviced = sh->serviced;
+}
+
+int send_data(int fd, struct synapsed_header *sh, char *data, char *target)
+{
+	struct iovec iov[3];
+	int iovcnt = 2;
+
+	iov[0].iov_base = sh;
+	iov[0].iov_len = sizeof(struct synapsed_header);
+	iov[1].iov_base = target;
+	iov[1].iov_len = sh->targetlen;
+	if (sh->op == X_WRITE && !(sh->state & XS_SERVED)) {
+		iov[2].iov_base = data;
+		iov[2].iov_len = sh->datalen;
+		iovcnt = 3;
+	}
+
+	writev(fd, iov, iovcnt);
+	return 0;
+}
+
+int recv_synapsed_header(int fd, struct synapsed_header *sh)
+{
+	read(fd, sh, sizeof(struct synapsed_header));
+	return 0;
+}
+
+int recv_data(int fd, struct synapsed_header *sh, char *data, char *target)
+{
+	struct iovec iov[2];
+	int iovcnt = 1;
+
+	iov[0].iov_base = target;
+	iov[0].iov_len = sh->targetlen;
+	if (sh->op == X_READ && sh->state & XS_SERVED) {
+		iov[1].iov_base = data;
+		iov[1].iov_len = sh->datalen;
+		iovcnt = 2;
+	}
+
+	readv(fd, iov, iovcnt);
+	return 0;
+}
 
 /********************************\
  * Connection-related functions *
@@ -331,7 +386,7 @@ int connect_to_remote(struct synapsed *syn, struct sockaddr_in *raddr_in)
 	if (send(sockfd, &syn->hp, sizeof(syn->hp), 0) == -1)
 		XSEGLOG2(&lc, E, "Error during send()");
 
-	return 0;
+	return sockfd;
 socket_fail:
 	close(sockfd);
 	return -1;
@@ -354,8 +409,9 @@ int update_remote(struct synapsed *syn, int fd)
 		if (r < 0)
 			goto eexist;
 		XSEGLOG2(&lc, I, "Remote has been updated with correct port (%d)", rport);
+		return 0;
 	}
-	return 0;
+	return 1;
 
 eexist:
 	XSEGLOG2(&lc, E, "fd (%d) of accepted "

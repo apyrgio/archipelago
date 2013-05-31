@@ -69,7 +69,7 @@ void custom_peer_usage()
 			"    -hp       | 1134 | Host port to bind\n"
 			"    -ra       | None | Remote address\n"
 			"    -rp       | 1134 | Remote port to connect\n"
-			"    -txp      | None | Target xseg port (on remote)\n"
+			"    -txp      | None | Target xseg port (on host)\n"
 			"\n"
 			"Additional information:\n"
 			"  --------------------------------------------\n"
@@ -266,27 +266,47 @@ static int handle_accept(struct peerd *peer, struct peer_req *pr,
 {
 	struct synapsed *syn = __get_synapsed(peer);
 	struct synapsed_header sh;
+	char *req_data, *req_target;
+	int r, fd;
 
 	/* The remote address is hardcoded in the synapsed struct for now */
-	if (connect_to_remote(syn, &syn->raddr_in) < 0)
+	fd = connect_to_remote(syn, &syn->raddr_in);
+	if (fd < 0)
 		return -1;
 
-	create_synapsed_header(&sh, req);
-
-	fail(peer, pr);
-#if 0
-	switch (req->op) {
-		case X_READ:
-		case X_WRITE:
-		default:
+	r = xseg_set_req_data(peer->xseg, req, pr);
+	if (r < 0) {
+		XSEGLOG2(&lc, W, "Cannot set request data\n");
+		goto put_peer_request;
 	}
-#endif
+	create_synapsed_header(&sh, req);
+	req_data = xseg_get_data(peer->xseg, req);
+	req_target = xseg_get_target(peer->xseg, req);
+	send_data(fd, &sh, req_data, req_target);
+
 	return 0;
+put_peer_request:
+	return -1;
 }
 
 static int handle_receive(struct peerd *peer, struct peer_req *pr,
 			struct xseg_request *req)
 {
+	struct synapsed *syn = __get_synapsed(peer);
+	struct synapsed_header sh;
+	char *req_data, *req_target;
+	int fd;
+
+	fd = connect_to_remote(syn, &syn->raddr_in);
+	if (fd < 0)
+		return -1;
+
+	create_synapsed_header(&sh, req);
+	sh.req = pr->req;
+	req_data = xseg_get_data(peer->xseg, req);
+	req_target = xseg_get_target(peer->xseg, req);
+	send_data(fd, &sh, req_data, req_target);
+
 	return 0;
 }
 
@@ -314,21 +334,96 @@ int dispatch(struct peerd *peer, struct peer_req *pr, struct xseg_request *req,
  * handle_recv() first checks if the remote has sent an update packet (e.g. its
  * port)
  */
-static void handle_recv(struct synapsed *syn, int fd)
+static int handle_recv(struct synapsed *syn, int fd)
 {
+	struct xseg_request *req;
+	struct peerd *peer = syn->peer;
+	struct xseg *xseg = peer->xseg;
+	struct peer_req *pr;
+	struct synapsed_header sh;
+	char *req_data, *req_target;
+	xport srcport = peer->portno_start;
+	xport dstport = syn->txp;
+	xport p;
 	int r;
 
-	r = update_remote(syn, fd);
-	if (r < 0)
-		return;
+	XSEGLOG2(&lc, D, "Ready to receive from socket");
 
-#if 0
-	snprintf(bufs, MAX_MESSAGE_LEN, "server says: %s at your face", bufr);
-	if (send(fd, bufs, MAX_MESSAGE_LEN, 0) == -1) {
-		XSEGLOG2(&lc, E, "Error during send()");
-		return;
+	r = update_remote(syn, fd);
+	if (r <= 0)
+		return r;
+
+	recv_synapsed_header(fd, &sh);
+
+	r =  xseg_get_req_data(xseg, sh.req, (void **) &pr);
+	if (r >= 0 && pr) {
+		req = pr->req;
+		req_data = xseg_get_data(peer->xseg, req);
+		req_target = xseg_get_target(peer->xseg, req);
+		recv_data(fd, &sh, req_data, req_target);
+
+		if (req->state & XS_SERVED)
+			complete(peer, pr);
+		else
+			fail(peer, pr);
+
+		return 0;
 	}
-#endif
+	/* For now, dst_port is hardcoded */
+	XSEGLOG2(&lc, D, "Get new request\n");
+	req = xseg_get_request(xseg, srcport, dstport, X_ALLOC);
+	if (!req) {
+		XSEGLOG2(&lc, W, "Cannot get request\n");
+		return -1;
+	}
+
+	//Allocate enough space for the data and the target's name
+	XSEGLOG2(&lc, D, "Prepare new request\n");
+	r = xseg_prep_request(xseg, req, sh.targetlen, sh.datalen);
+	if (r < 0) {
+		XSEGLOG2(&lc, W, "Cannot prepare request! (%lu, %llu)\n",
+				sh.targetlen, sh.datalen);
+		goto put_xseg_request;
+	}
+
+	req_data = xseg_get_data(peer->xseg, req);
+	req_target = xseg_get_target(peer->xseg, req);
+	recv_data(fd, &sh, req_data, req_target);
+	//Measure this?
+	XSEGLOG2(&lc, D, "Allocate peer request\n");
+	pr = alloc_peer_req(peer);
+	if (!pr) {
+		XSEGLOG2(&lc, W, "Cannot allocate peer request (%ld remaining)\n",
+				peer->nr_ops - xq_count(&peer->free_reqs));
+		goto put_xseg_request;
+	}
+	pr->peer = peer;
+	pr->portno = srcport;
+	pr->req = req;
+
+	r = xseg_set_req_data(peer->xseg, req, pr);
+	if (r < 0) {
+		XSEGLOG2(&lc, W, "Cannot set request data\n");
+		goto put_peer_request;
+	}
+
+	p = xseg_submit(xseg, req, srcport, X_ALLOC);
+	if (p == NoPort) {
+		XSEGLOG2(&lc, W, "Cannot submit request\n");
+		goto put_peer_request;
+	}
+
+	r = xseg_signal(xseg, p);
+
+	return 0;
+
+put_peer_request:
+	free(pr->priv);
+	free_peer_req(peer, pr);
+put_xseg_request:
+	if (xseg_put_request(xseg, req, srcport))
+		XSEGLOG2(&lc, W, "Cannot put request\n");
+	return -1;
 }
 
 static void handle_send(struct synapsed *syn, int fd)
