@@ -48,6 +48,8 @@
 #define SOCKFD_ESTALE -2
 #define SOCKFD_ENOSPC -3
 
+#define SH_REQUEST 1 << 0
+#define SH_REPLY 1 << 1
 
 struct synapsed {
 	struct peerd *peer;
@@ -67,8 +69,14 @@ struct cached_sockfd {
 };
 
 #pragma pack(push, 1)
-struct synapsed_header {
+struct original_request {
+	struct peer_req *pr;
 	struct xseg_request *req;
+	uint32_t sh_flags;
+};
+
+struct synapsed_header {
+	struct original_request orig_req;
 	uint32_t op;
 	uint32_t state;
 	uint32_t flags;
@@ -88,12 +96,15 @@ int insert_sockfds(struct cached_sockfd *cfd,
 		struct sockaddr_in *sin, int fd, int status);
 int update_sockfds(struct cached_sockfd *cfd, int fd, int new_port);
 int stat_sockfds(struct cached_sockfd *cfd, int fd);
-void init_pollfds(struct pollfd *pfds);
-int addto_pollfds(struct pollfd *pfds, int fd, short flags);
+void pollfds_init(struct pollfd *pfds);
+int pollfds_add(struct pollfd *pfds, int fd, short flags);
+int pollfds_remove(struct pollfd *pfds, int fd);
 
 int synapsed_init_local_signal(struct peerd *peer, sigset_t *oldset);
 
-void create_synapsed_header(struct synapsed_header *sh, struct xseg_request *req);
+void pack_request(struct synapsed_header *sh, struct peer_req *pr,
+		struct xseg_request *req, uint32_t sh_flags);
+void unpack_request(struct synapsed_header *sh, struct xseg_request *req);
 int recv_synapsed_header(int fd, struct synapsed_header *sh);
 int send_data(int fd, struct synapsed_header *sh, char *data, char *target);
 int recv_data(int fd, struct synapsed_header *sh, char *data, char *target);

@@ -73,7 +73,7 @@ static void *get_in_addr(struct sockaddr *sa)
 
 void print_sockfd(struct cached_sockfd *cfd)
 {
-	XSEGLOG2(&lc, I, "fd: %d, addr %ld, port %d, status %d",
+	XSEGLOG2(&lc, I, "fd: %d, addr: %ld, port: %d, status: %d",
 			cfd->fd, cfd->s_addr, cfd->port, cfd->status);
 }
 
@@ -138,13 +138,13 @@ int stat_sockfds(struct cached_sockfd *cfd, int fd)
  * Pollfd functions *
 \********************/
 
-void init_pollfds(struct pollfd *fds)
+void pollfds_init(struct pollfd *fds)
 {
 	for (int i = 0; i < MAX_SOCKETS; i++)
 		fds[i].fd = -1;
 }
 
-int addto_pollfds(struct pollfd *fds, int fd, short flags)
+int pollfds_add(struct pollfd *fds, int fd, short flags)
 {
 	for (int i = 0; i < MAX_SOCKETS; i++) {
 		if (fds[i].fd < 0) {
@@ -156,6 +156,21 @@ int addto_pollfds(struct pollfd *fds, int fd, short flags)
 
 	return -1;
 }
+
+int pollfds_remove(struct pollfd *fds, int fd)
+{
+	for (int i = 0; i < MAX_SOCKETS; i++) {
+		if (fds[i].fd == fd) {
+			fds[i].fd = -1;
+			fds[i].events = 0;
+			return 0;
+		}
+	}
+
+	return -1;
+}
+
+
 
 /***************************\
  * Custom signal functions *
@@ -196,9 +211,15 @@ int synapsed_init_local_signal(struct peerd *peer, sigset_t *oldset)
  * Data serialization functions *
 \********************************/
 
-void create_synapsed_header(struct synapsed_header *sh, struct xseg_request *req)
+void pack_request(struct synapsed_header *sh, struct peer_req *pr,
+		struct xseg_request *req, uint32_t sh_flags)
 {
-	sh->req = req;
+	struct original_request *orig_req = &sh->orig_req;
+
+	orig_req->pr = pr;
+	orig_req->req = req;
+	orig_req->sh_flags = sh_flags;
+
 	sh->xseg_dst_portno = req->dst_portno;
 	sh->op = req->op;
 	sh->state = req->state;
@@ -208,11 +229,13 @@ void create_synapsed_header(struct synapsed_header *sh, struct xseg_request *req
 	sh->targetlen = req->targetlen;
 	sh->size = req->size;
 	sh->serviced = req->serviced;
+
+	XSEGLOG2(&lc, D, "sh: %p, req: %p, op: %lu, sh_flags: %u",
+			sh, orig_req->req, sh->op, orig_req->sh_flags);
 }
 
-void read_synapsed_header(struct synapsed_header *sh, struct xseg_request *req)
+void unpack_request(struct synapsed_header *sh, struct xseg_request *req)
 {
-	req = sh->req;
 	req->dst_portno = sh->xseg_dst_portno;
 	req->op = sh->op;
 	req->state = sh->state;
@@ -222,30 +245,37 @@ void read_synapsed_header(struct synapsed_header *sh, struct xseg_request *req)
 	req->targetlen = sh->targetlen;
 	req->size = sh->size;
 	req->serviced = sh->serviced;
+
+	XSEGLOG2(&lc, D, "sh: %p, req: %p, op: %lu, sh_flags: %u",
+			sh, sh->orig_req.req, req->op, sh->orig_req.sh_flags);
 }
 
 int send_data(int fd, struct synapsed_header *sh, char *data, char *target)
 {
 	struct iovec iov[3];
 	int iovcnt = 2;
+	int r;
 
 	iov[0].iov_base = sh;
 	iov[0].iov_len = sizeof(struct synapsed_header);
 	iov[1].iov_base = target;
 	iov[1].iov_len = sh->targetlen;
-	if (sh->op == X_WRITE && !(sh->state & XS_SERVED)) {
+	if (sh->op == X_WRITE && sh->orig_req.sh_flags & SH_REQUEST) {
 		iov[2].iov_base = data;
 		iov[2].iov_len = sh->datalen;
 		iovcnt = 3;
 	}
 
-	writev(fd, iov, iovcnt);
-	return 0;
+	r = writev(fd, iov, iovcnt);
+	return r;
 }
 
 int recv_synapsed_header(int fd, struct synapsed_header *sh)
 {
 	read(fd, sh, sizeof(struct synapsed_header));
+
+	XSEGLOG2(&lc, D, "sh: %p, req: %p, op: %lu, sh_flags: %u",
+			sh, sh->orig_req.req, sh->op, sh->orig_req.sh_flags);
 	return 0;
 }
 
@@ -253,17 +283,18 @@ int recv_data(int fd, struct synapsed_header *sh, char *data, char *target)
 {
 	struct iovec iov[2];
 	int iovcnt = 1;
+	int r;
 
 	iov[0].iov_base = target;
 	iov[0].iov_len = sh->targetlen;
-	if (sh->op == X_READ && sh->state & XS_SERVED) {
+	if (sh->op == X_READ && sh->orig_req.sh_flags & SH_REPLY) {
 		iov[1].iov_base = data;
 		iov[1].iov_len = sh->datalen;
 		iovcnt = 2;
 	}
 
-	readv(fd, iov, iovcnt);
-	return 0;
+	r = readv(fd, iov, iovcnt);
+	return r;
 }
 
 /********************************\
@@ -292,7 +323,7 @@ int accept_remote(struct synapsed *syn)
 				XSEGLOG2(&lc, E, "Cache is full");
 				return -1;
 			}
-			if (addto_pollfds(syn->pfds, new_fd,
+			if (pollfds_add(syn->pfds, new_fd,
 						POLLIN | POLLERR | POLLHUP | POLLNVAL) < 0) {
 				XSEGLOG2(&lc, E, "Pollfd is full");
 				return -1;
@@ -319,9 +350,10 @@ int connect_to_remote(struct synapsed *syn, struct sockaddr_in *raddr_in)
 	int sockflags;
 	int r;
 
-	if (lookup_sockfds(syn->cfd, raddr_in) >= 0) {
+	sockfd = lookup_sockfds(syn->cfd, raddr_in);
+	if (sockfd >= 0) {
 		XSEGLOG2(&lc, I, "Connection has already been established");
-		return 0;
+		return sockfd;
 	}
 
 	inet_ntop(AF_INET, &raddr_in->sin_addr, raddr, INET_ADDRSTRLEN);
@@ -368,6 +400,8 @@ int connect_to_remote(struct synapsed *syn, struct sockaddr_in *raddr_in)
 
 	freeaddrinfo(reminfo);
 
+	XSEGLOG2(&lc, I, "Connection has been established succesfully");
+
 	/* Make socket NON-BLOCKING */
 	if ((sockflags = fcntl(sockfd, F_GETFL, 0)) < 0 ||
 		fcntl(sockfd, F_SETFL, sockflags | O_NONBLOCK) < 0) {
@@ -375,14 +409,17 @@ int connect_to_remote(struct synapsed *syn, struct sockaddr_in *raddr_in)
 		goto socket_fail;
 	}
 
-	if (addto_pollfds(syn->pfds, sockfd,
-				POLLIN | POLLERR | POLLHUP | POLLNVAL) < 0)
+	if (pollfds_add(syn->pfds, sockfd,
+				POLLIN | POLLERR | POLLHUP | POLLNVAL) < 0) {
+		XSEGLOG2(&lc, E, "Could not insert to pollfds");
 		return -1;
+	}
 	if (insert_sockfds(syn->cfd, raddr_in, sockfd, SOCKFD_VERIFIED) < 0) {
 		XSEGLOG2(&lc, E, "Cache is full");
 		return -1;
 	}
 
+	XSEGLOG2(&lc, I, "Sending update packet");
 	if (send(sockfd, &syn->hp, sizeof(syn->hp), 0) == -1)
 		XSEGLOG2(&lc, E, "Error during send()");
 

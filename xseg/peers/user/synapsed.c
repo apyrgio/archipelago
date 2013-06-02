@@ -80,6 +80,7 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 {
 	struct synapsed *syn;
 	struct addrinfo hints, *hostinfo, *p;
+	struct original_request *orig_req;
 	char host_port[MAX_PORT_LEN + 1];
 	char ra[MAX_ADDR_LEN + 1];
 	unsigned long rp = -1;
@@ -87,7 +88,7 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	int sockfd;
 	int sockflags;
 	int optval = 1;
-	int r;
+	int i, r;
 
 	ra[0] = 0;
 
@@ -98,7 +99,7 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	syn = malloc(sizeof(struct synapsed));
 	if (!syn) {
 		XSEGLOG2(&lc, E, "Malloc fail");
-		goto fail;
+		goto syn_fail;
 	}
 	memset(syn, 0, sizeof(struct synapsed));
 	syn->hp = -1;
@@ -106,16 +107,25 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	syn->cfd = malloc(MAX_SOCKETS * sizeof(struct cached_sockfd));
 	if (!syn->cfd) {
 		XSEGLOG2(&lc, E, "Malloc fail");
-		goto fail;
+		goto syn_fail;
 	}
 	memset(syn->cfd, 0, MAX_SOCKETS * sizeof(struct cached_sockfd));
 
 	syn->pfds = malloc(MAX_SOCKETS * sizeof(struct pollfd));
 	if (!syn->pfds) {
 		XSEGLOG2(&lc, E, "Malloc fail");
-		goto fail;
+		goto syn_fail;
 	}
 	memset(syn->pfds, 0, MAX_SOCKETS * sizeof(struct pollfd));
+
+	for (i = 0; i < peer->nr_ops; i++) {
+		orig_req = malloc(sizeof(struct original_request));
+		if (!orig_req) {
+			XSEGLOG2(&lc, E, "Malloc fail");
+			goto pr_fail;
+		}
+		peer->peer_reqs[i].priv = (void *)orig_req;
+	}
 
 	/**********************\
 	 * Synapsed arguments *
@@ -230,8 +240,8 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	\*********************************/
 
 	syn->sockfd = sockfd;
-	init_pollfds(syn->pfds);
-	if (addto_pollfds(syn->pfds, syn->sockfd,
+	pollfds_init(syn->pfds);
+	if (pollfds_add(syn->pfds, syn->sockfd,
 				POLLIN | POLLERR | POLLHUP | POLLNVAL) < 0)
 		return -1;
 
@@ -242,7 +252,11 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	return 0;
 socket_fail:
 	close(sockfd);
-fail:
+fail: ;
+pr_fail:
+	for (--i; i >= 0; i--)
+		free(peer->peer_reqs[i].priv);
+syn_fail:
 	free(syn->cfd);
 	free(syn->pfds);
 	free(syn);
@@ -259,7 +273,8 @@ void custom_peer_finalize(struct peerd *peer)
 
 /*
  * handle_accept() first creates a connection with the remote server.
- * Then, it creates the header for the request
+ * Then, it packs the request in a custom header and performs immediately
+ * a gather write to send the {header, target, data} tuple to the remote.
  */
 static int handle_accept(struct peerd *peer, struct peer_req *pr,
 			struct xseg_request *req)
@@ -269,24 +284,28 @@ static int handle_accept(struct peerd *peer, struct peer_req *pr,
 	char *req_data, *req_target;
 	int r, fd;
 
+	XSEGLOG2(&lc, D, "Started (pr: %p, req: %p)", pr, req);
+
 	/* The remote address is hardcoded in the synapsed struct for now */
 	fd = connect_to_remote(syn, &syn->raddr_in);
 	if (fd < 0)
 		return -1;
 
-	r = xseg_set_req_data(peer->xseg, req, pr);
-	if (r < 0) {
-		XSEGLOG2(&lc, W, "Cannot set request data\n");
-		goto put_peer_request;
-	}
-	create_synapsed_header(&sh, req);
+	XSEGLOG2(&lc, D, "Pack request %p", req);
+	pack_request(&sh, pr, req, SH_REQUEST);
 	req_data = xseg_get_data(peer->xseg, req);
 	req_target = xseg_get_target(peer->xseg, req);
-	send_data(fd, &sh, req_data, req_target);
 
+	XSEGLOG2(&lc, D, "Gathering data for target %s\n"
+			"\t(pr: %p, req: %p, dl: %lu, tl: %u)",
+			req_target, sh.orig_req.pr, sh.orig_req.req,
+			sh.datalen, sh.targetlen);
+	r = send_data(fd, &sh, req_data, req_target);
+	if (r <= 0)
+		XSEGLOG2(&lc, E, "No data were transfered");
+
+	XSEGLOG2(&lc, D, "Finished (pr: %p, req: %p)", pr, req);
 	return 0;
-put_peer_request:
-	return -1;
 }
 
 static int handle_receive(struct peerd *peer, struct peer_req *pr,
@@ -294,19 +313,38 @@ static int handle_receive(struct peerd *peer, struct peer_req *pr,
 {
 	struct synapsed *syn = __get_synapsed(peer);
 	struct synapsed_header sh;
+	struct original_request *orig_req = pr->priv;
 	char *req_data, *req_target;
-	int fd;
+	int r, fd;
 
+	XSEGLOG2(&lc, D, "Started (pr: %p, req: %p)", pr, req);
 	fd = connect_to_remote(syn, &syn->raddr_in);
+	XSEGLOG2(&lc, D, "fd: %d", fd);
 	if (fd < 0)
 		return -1;
 
-	create_synapsed_header(&sh, req);
-	sh.req = pr->req;
+	XSEGLOG2(&lc, D, "Create header");
+	pack_request(&sh, NULL, req, SH_REPLY);
+	/* Restore original request's address */
+	sh.orig_req.pr = orig_req->pr;
+	sh.orig_req.req = orig_req->req;
+
 	req_data = xseg_get_data(peer->xseg, req);
 	req_target = xseg_get_target(peer->xseg, req);
-	send_data(fd, &sh, req_data, req_target);
 
+	XSEGLOG2(&lc, D, "Gathering data for target %s (fd: %d)\n"
+			"\t(pr: %p, req: %p, dl: %lu, tl: %u)",
+			req_target, fd, sh.orig_req.pr, sh.orig_req.req,
+			sh.datalen, sh.targetlen);
+	r = send_data(fd, &sh, req_data, req_target);
+	if (r <= 0)
+		XSEGLOG2(&lc, E, "No data were transfered");
+
+	if (xseg_put_request(peer->xseg, pr->req, pr->portno))
+		XSEGLOG2(&lc, W, "Cannot put xseg request\n");
+
+	free_peer_req(peer, pr);
+	XSEGLOG2(&lc, D, "Finished (pr: %p, req: %p)", pr, req);
 	return 0;
 }
 
@@ -332,7 +370,11 @@ int dispatch(struct peerd *peer, struct peer_req *pr, struct xseg_request *req,
 
 /*
  * handle_recv() first checks if the remote has sent an update packet (e.g. its
- * port)
+ * port). Then, it receives the synapsed header. Depending on the header type
+ * (SH_REQUEST or SH_REPLY) it either:
+ *
+ * 1. creates a new request with the appropriate targetlen, datalen, sets the
+ *    request data
  */
 static int handle_recv(struct synapsed *syn, int fd)
 {
@@ -341,26 +383,38 @@ static int handle_recv(struct synapsed *syn, int fd)
 	struct xseg *xseg = peer->xseg;
 	struct peer_req *pr;
 	struct synapsed_header sh;
+	struct original_request *orig_req, *pr_orig_req;
 	char *req_data, *req_target;
 	xport srcport = peer->portno_start;
 	xport dstport = syn->txp;
 	xport p;
 	int r;
 
-	XSEGLOG2(&lc, D, "Ready to receive from socket");
+	XSEGLOG2(&lc, D, "Started (fd: %d)", fd);
 
 	r = update_remote(syn, fd);
 	if (r <= 0)
 		return r;
 
-	recv_synapsed_header(fd, &sh);
+	r = recv_synapsed_header(fd, &sh);
+	orig_req = &sh.orig_req;
 
-	r =  xseg_get_req_data(xseg, sh.req, (void **) &pr);
-	if (r >= 0 && pr) {
-		req = pr->req;
+	if (orig_req->sh_flags == SH_REPLY) {
+		pr = orig_req->pr;
+		req = orig_req->req;
+
+		XSEGLOG2(&lc, D, "Received reply for request %p", req);
+		XSEGLOG2(&lc, D, "Unpacking reply for request %p", req);
+
+		unpack_request(&sh, req);
 		req_data = xseg_get_data(peer->xseg, req);
 		req_target = xseg_get_target(peer->xseg, req);
-		recv_data(fd, &sh, req_data, req_target);
+
+		XSEGLOG2(&lc, D, "Scattering rest of data (req: %p, dl: %lu, tl: %lu)",
+				req, req->datalen, req->targetlen);
+		r = recv_data(fd, &sh, req_data, req_target);
+		if (r <= 0)
+			XSEGLOG2(&lc, E, "No data where transfered");
 
 		if (req->state & XS_SERVED)
 			complete(peer, pr);
@@ -369,6 +423,7 @@ static int handle_recv(struct synapsed *syn, int fd)
 
 		return 0;
 	}
+
 	/* For now, dst_port is hardcoded */
 	XSEGLOG2(&lc, D, "Get new request\n");
 	req = xseg_get_request(xseg, srcport, dstport, X_ALLOC);
@@ -377,9 +432,12 @@ static int handle_recv(struct synapsed *syn, int fd)
 		return -1;
 	}
 
+	XSEGLOG2(&lc, D, "Unpack request\n");
+	unpack_request(&sh, req);
+
 	//Allocate enough space for the data and the target's name
 	XSEGLOG2(&lc, D, "Prepare new request\n");
-	r = xseg_prep_request(xseg, req, sh.targetlen, sh.datalen);
+	r = xseg_prep_request(xseg, req, req->targetlen, req->datalen);
 	if (r < 0) {
 		XSEGLOG2(&lc, W, "Cannot prepare request! (%lu, %llu)\n",
 				sh.targetlen, sh.datalen);
@@ -388,8 +446,12 @@ static int handle_recv(struct synapsed *syn, int fd)
 
 	req_data = xseg_get_data(peer->xseg, req);
 	req_target = xseg_get_target(peer->xseg, req);
-	recv_data(fd, &sh, req_data, req_target);
-	//Measure this?
+	XSEGLOG2(&lc, D, "Scattering data for target %s (req: %p, dl: %lu, tl: %lu)",
+			req_target, sh.orig_req.req, sh.datalen, sh.targetlen);
+	r = recv_data(fd, &sh, req_data, req_target);
+	if (r <= 0)
+		XSEGLOG2(&lc, E, "No data where transfered");
+
 	XSEGLOG2(&lc, D, "Allocate peer request\n");
 	pr = alloc_peer_req(peer);
 	if (!pr) {
@@ -397,9 +459,14 @@ static int handle_recv(struct synapsed *syn, int fd)
 				peer->nr_ops - xq_count(&peer->free_reqs));
 		goto put_xseg_request;
 	}
+	pr->req = req;
 	pr->peer = peer;
 	pr->portno = srcport;
-	pr->req = req;
+
+	/* Saving original request in priv of allocated pr */
+	pr_orig_req = (struct original_request *)pr->priv;
+	pr_orig_req->pr = orig_req->pr;
+	pr_orig_req->req = orig_req->req;
 
 	r = xseg_set_req_data(peer->xseg, req, pr);
 	if (r < 0) {
@@ -414,6 +481,8 @@ static int handle_recv(struct synapsed *syn, int fd)
 	}
 
 	r = xseg_signal(xseg, p);
+
+	XSEGLOG2(&lc, D, "Finished (fd: %d)", fd);
 
 	return 0;
 
@@ -438,12 +507,22 @@ static int handle_accept_conn(struct synapsed *syn)
 	return 0;
 }
 
+static int handle_hangup(struct synapsed *syn, int fd)
+{
+	XSEGLOG2(&lc, W, "A hangup has occured for fd %d", fd);
+	pollfds_remove(syn->pfds, fd);
+	close(fd);
+	return -1;
+}
+
 /*
  * handle_event() is the poll() equivalent of dispatch(). It associates each
  * revent with the appropriate function
  */
 static void handle_event(struct synapsed *syn, struct pollfd *pfd)
 {
+	int r = 0;
+
 	/* Our listening socket must only accept connections */
 	if (pfd->fd == syn->sockfd) {
 		if (pfd->revents & POLLIN) {
@@ -460,9 +539,13 @@ static void handle_event(struct synapsed *syn, struct pollfd *pfd)
 	if (pfd->revents & POLLERR)
 		XSEGLOG2(&lc, E, "An error has occured for fd %d", pfd->fd);
 	if (pfd->revents & POLLHUP)
-		XSEGLOG2(&lc, W, "A hangup has occured for fd %d", pfd->fd);
+		r = handle_hangup(syn, pfd->fd);
 	if (pfd->revents & POLLNVAL)
 		XSEGLOG2(&lc, W, "Socket fd %d is not open", pfd->fd);
+
+	if (r < 0)
+		return;
+
 	if (pfd->revents & POLLIN)
 		handle_recv(syn, pfd->fd);
 	if (pfd->revents & POLLOUT)
