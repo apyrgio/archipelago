@@ -282,7 +282,8 @@ static int handle_accept(struct peerd *peer, struct peer_req *pr,
 	struct synapsed *syn = __get_synapsed(peer);
 	struct synapsed_header sh;
 	char *req_data, *req_target;
-	int r, fd;
+	int fd;
+	ssize_t r;
 
 	XSEGLOG2(&lc, D, "Started (pr: %p, req: %p)", pr, req);
 
@@ -315,7 +316,8 @@ static int handle_receive(struct peerd *peer, struct peer_req *pr,
 	struct synapsed_header sh;
 	struct original_request *orig_req = pr->priv;
 	char *req_data, *req_target;
-	int r, fd;
+	int fd;
+	ssize_t r;
 
 	XSEGLOG2(&lc, D, "Started (pr: %p, req: %p)", pr, req);
 	fd = connect_to_remote(syn, &syn->raddr_in);
@@ -389,6 +391,7 @@ static int handle_recv(struct synapsed *syn, int fd)
 	xport dstport = syn->txp;
 	xport p;
 	int r;
+	ssize_t bytes;
 
 	XSEGLOG2(&lc, D, "Started (fd: %d)", fd);
 
@@ -412,8 +415,8 @@ static int handle_recv(struct synapsed *syn, int fd)
 
 		XSEGLOG2(&lc, D, "Scattering rest of data (req: %p, dl: %lu, tl: %lu)",
 				req, req->datalen, req->targetlen);
-		r = recv_data(fd, &sh, req_data, req_target);
-		if (r <= 0)
+		bytes = recv_data(fd, &sh, req_data, req_target);
+		if (bytes <= 0)
 			XSEGLOG2(&lc, E, "No data where transfered");
 
 		if (req->state & XS_SERVED)
@@ -448,8 +451,8 @@ static int handle_recv(struct synapsed *syn, int fd)
 	req_target = xseg_get_target(peer->xseg, req);
 	XSEGLOG2(&lc, D, "Scattering data for target %s (req: %p, dl: %lu, tl: %lu)",
 			req_target, sh.orig_req.req, sh.datalen, sh.targetlen);
-	r = recv_data(fd, &sh, req_data, req_target);
-	if (r <= 0)
+	bytes = recv_data(fd, &sh, req_data, req_target);
+	if (bytes <= 0)
 		XSEGLOG2(&lc, E, "No data where transfered");
 
 	XSEGLOG2(&lc, D, "Allocate peer request\n");

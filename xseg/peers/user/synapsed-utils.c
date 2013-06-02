@@ -250,24 +250,101 @@ void unpack_request(struct synapsed_header *sh, struct xseg_request *req)
 			sh, sh->orig_req.req, req->op, sh->orig_req.sh_flags);
 }
 
-int send_data(int fd, struct synapsed_header *sh, char *data, char *target)
+ssize_t send_data(int fd, struct synapsed_header *sh, char *data, char *target)
 {
 	struct iovec iov[3];
 	int iovcnt = 2;
-	int r;
+	ssize_t total, written, partial;
+	int i;
 
 	iov[0].iov_base = sh;
 	iov[0].iov_len = sizeof(struct synapsed_header);
+	total = iov[0].iov_len;
+
 	iov[1].iov_base = target;
 	iov[1].iov_len = sh->targetlen;
+	total += iov[1].iov_len;
+
 	if (sh->op == X_WRITE && sh->orig_req.sh_flags & SH_REQUEST) {
 		iov[2].iov_base = data;
 		iov[2].iov_len = sh->datalen;
 		iovcnt = 3;
+		total += iov[2].iov_len;
 	}
 
-	r = writev(fd, iov, iovcnt);
-	return r;
+	written = 0;
+	partial = 0;
+	i = 0;
+	while (written < total) {
+		iov[i].iov_base = (char *)iov[i].iov_base + partial;
+		iov[i].iov_len -= partial;
+
+		partial = writev(fd, iov + i, iovcnt - i);
+		if (partial < 0) {
+			if (errno == -EINTR) {
+				partial = 0;
+				continue;
+			}
+			goto error;
+		}
+		written += partial;
+
+		while (i < iovcnt && partial < iov[i].iov_len)
+			partial -= iov[i++].iov_len;
+	}
+
+	return written;
+
+error:
+	XSEGLOG2(&lc, E, "Gather write has failed with error %d", errno);
+	return -1;
+}
+
+ssize_t recv_data(int fd, struct synapsed_header *sh, char *target, char *data)
+{
+	struct iovec iov[2];
+	int iovcnt = 1;
+	ssize_t total, read, partial;
+	int i;
+
+	iov[0].iov_base = target;
+	iov[0].iov_len = sh->targetlen;
+	total = iov[0].iov_len;
+	if (sh->op == X_READ && sh->orig_req.sh_flags & SH_REPLY) {
+		iov[1].iov_base = data;
+		iov[1].iov_len = sh->datalen;
+		iovcnt = 2;
+		total = iov[1].iov_len;
+	}
+
+	read = 0;
+	partial = 0;
+	i = 0;
+	while (read < total) {
+		iov[i].iov_base = (char *)iov[i].iov_base + partial;
+		iov[i].iov_len -= partial;
+
+		partial = readv(fd, iov + i, iovcnt - i);
+		if (partial == 0)
+			return 0;	/* Connection closed? */
+		if (partial < 0) {
+			if (errno == -EINTR) {
+				partial = 0;
+				continue;
+			}
+			goto error;
+		}
+		read += partial;
+
+		while (i < iovcnt && partial < iov[i].iov_len)
+			partial -= iov[i++].iov_len;
+	}
+
+	return read;
+
+error:
+	XSEGLOG2(&lc, E, "Scatter read has failed with error %d", errno);
+	return -1;
 }
 
 int recv_synapsed_header(int fd, struct synapsed_header *sh)
@@ -277,24 +354,6 @@ int recv_synapsed_header(int fd, struct synapsed_header *sh)
 	XSEGLOG2(&lc, D, "sh: %p, req: %p, op: %lu, sh_flags: %u",
 			sh, sh->orig_req.req, sh->op, sh->orig_req.sh_flags);
 	return 0;
-}
-
-int recv_data(int fd, struct synapsed_header *sh, char *data, char *target)
-{
-	struct iovec iov[2];
-	int iovcnt = 1;
-	int r;
-
-	iov[0].iov_base = target;
-	iov[0].iov_len = sh->targetlen;
-	if (sh->op == X_READ && sh->orig_req.sh_flags & SH_REPLY) {
-		iov[1].iov_base = data;
-		iov[1].iov_len = sh->datalen;
-		iovcnt = 2;
-	}
-
-	r = readv(fd, iov, iovcnt);
-	return r;
 }
 
 /********************************\

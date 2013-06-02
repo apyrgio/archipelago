@@ -106,8 +106,8 @@ void pack_request(struct synapsed_header *sh, struct peer_req *pr,
 		struct xseg_request *req, uint32_t sh_flags);
 void unpack_request(struct synapsed_header *sh, struct xseg_request *req);
 int recv_synapsed_header(int fd, struct synapsed_header *sh);
-int send_data(int fd, struct synapsed_header *sh, char *data, char *target);
-int recv_data(int fd, struct synapsed_header *sh, char *data, char *target);
+ssize_t send_data(int fd, struct synapsed_header *sh, char *target, char *data);
+ssize_t recv_data(int fd, struct synapsed_header *sh, char *target, char *data);
 
 int accept_remote(struct synapsed *syn);
 int connect_to_remote(struct synapsed *syn, struct sockaddr_in *raddr_in);
