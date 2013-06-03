@@ -66,6 +66,18 @@ static void *get_in_addr(struct sockaddr *sa)
 	return &(((struct sockaddr_in6*)sa)->sin6_addr);
 }
 
+static void print_synapsed_header(struct synapsed_header *sh)
+{
+	XSEGLOG2(&lc, D, "\n\tSynapsed header (%d bytes):\n"
+			"\tOriginal request: pr: %p, req: %p, sh_flags %u\n"
+			"\tFields: op: %u, state %u, flags: %u,\n"
+			"\t\ttargetlen: %u, datalen: %lu, offset: %u, serviced: %lu",
+			sizeof(struct synapsed_header),
+			sh->orig_req.pr, sh->orig_req.req, sh->orig_req.sh_flags,
+			sh->op, sh->state, sh->flags,
+			sh->targetlen, sh->datalen, sh->offset, sh->serviced);
+}
+
 
 /**************************\
  * Sockfd cache functions *
