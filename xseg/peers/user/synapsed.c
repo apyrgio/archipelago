@@ -283,7 +283,7 @@ static int handle_accept(struct peerd *peer, struct peer_req *pr,
 	struct synapsed_header sh;
 	char *req_data, *req_target;
 	int fd;
-	ssize_t r;
+	ssize_t bytes;
 
 	XSEGLOG2(&lc, D, "Started (pr: %p, req: %p)", pr, req);
 
@@ -292,21 +292,23 @@ static int handle_accept(struct peerd *peer, struct peer_req *pr,
 	if (fd < 0)
 		return -1;
 
-	XSEGLOG2(&lc, D, "Pack request %p", req);
-	pack_request(&sh, pr, req, SH_REQUEST);
 	req_data = xseg_get_data(peer->xseg, req);
 	req_target = xseg_get_target(peer->xseg, req);
+	XSEGLOG2(&lc, D, "Packing request %p for target %s", req, req_target);
+	pack_request(&sh, pr, req, SH_REQUEST);
 
-	XSEGLOG2(&lc, D, "Gathering data for target %s\n"
-			"\t(pr: %p, req: %p, dl: %lu, tl: %u)",
-			req_target, sh.orig_req.pr, sh.orig_req.req,
-			sh.datalen, sh.targetlen);
-	r = send_data(fd, &sh, req_data, req_target);
-	if (r <= 0)
-		XSEGLOG2(&lc, E, "No data were transfered");
+	XSEGLOG2(&lc, D, "Sending data to remote");
+	bytes = send_data(fd, &sh, req_target, req_data);
+	if (bytes < 0)
+		goto fail;
+	XSEGLOG2(&lc, D, "%lu bytes were transfered", bytes);
 
 	XSEGLOG2(&lc, D, "Finished (pr: %p, req: %p)", pr, req);
 	return 0;
+
+fail:
+	fail(peer, pr);
+	return -1;
 }
 
 static int handle_receive(struct peerd *peer, struct peer_req *pr,
@@ -317,30 +319,27 @@ static int handle_receive(struct peerd *peer, struct peer_req *pr,
 	struct original_request *orig_req = pr->priv;
 	char *req_data, *req_target;
 	int fd;
-	ssize_t r;
+	ssize_t bytes;
 
 	XSEGLOG2(&lc, D, "Started (pr: %p, req: %p)", pr, req);
 	fd = connect_to_remote(syn, &syn->raddr_in);
-	XSEGLOG2(&lc, D, "fd: %d", fd);
 	if (fd < 0)
 		return -1;
 
-	XSEGLOG2(&lc, D, "Create header");
 	pack_request(&sh, NULL, req, SH_REPLY);
-	/* Restore original request's address */
+	XSEGLOG2(&lc, D, "Restoring original request (req: %p, pr: %p)",
+			orig_req->pr, orig_req->req);
 	sh.orig_req.pr = orig_req->pr;
 	sh.orig_req.req = orig_req->req;
 
 	req_data = xseg_get_data(peer->xseg, req);
 	req_target = xseg_get_target(peer->xseg, req);
 
-	XSEGLOG2(&lc, D, "Gathering data for target %s (fd: %d)\n"
-			"\t(pr: %p, req: %p, dl: %lu, tl: %u)",
-			req_target, fd, sh.orig_req.pr, sh.orig_req.req,
-			sh.datalen, sh.targetlen);
-	r = send_data(fd, &sh, req_data, req_target);
-	if (r <= 0)
-		XSEGLOG2(&lc, E, "No data were transfered");
+	XSEGLOG2(&lc, D, "Gathering data for target %s", req_target);
+	bytes = send_data(fd, &sh, req_target, req_data);
+	if (bytes < 0)
+		goto reply_fail;
+	XSEGLOG2(&lc, D, "%lu bytes were transfered", bytes);
 
 	if (xseg_put_request(peer->xseg, pr->req, pr->portno))
 		XSEGLOG2(&lc, W, "Cannot put xseg request\n");
@@ -348,6 +347,10 @@ static int handle_receive(struct peerd *peer, struct peer_req *pr,
 	free_peer_req(peer, pr);
 	XSEGLOG2(&lc, D, "Finished (pr: %p, req: %p)", pr, req);
 	return 0;
+
+reply_fail:
+	XSEGLOG2(&lc, E, "Could not send reply for request %p", orig_req->req);
+	return -1;
 }
 
 int dispatch(struct peerd *peer, struct peer_req *pr, struct xseg_request *req,
@@ -390,8 +393,8 @@ static int handle_recv(struct synapsed *syn, int fd)
 	xport srcport = peer->portno_start;
 	xport dstport = syn->txp;
 	xport p;
-	int r;
 	ssize_t bytes;
+	int r;
 
 	XSEGLOG2(&lc, D, "Started (fd: %d)", fd);
 
@@ -399,25 +402,26 @@ static int handle_recv(struct synapsed *syn, int fd)
 	if (r <= 0)
 		return r;
 
-	r = recv_synapsed_header(fd, &sh);
+	bytes = recv_synapsed_header(fd, &sh);
+	if (bytes <= 0)
+		goto accept_fail;
+
 	orig_req = &sh.orig_req;
 
 	if (orig_req->sh_flags == SH_REPLY) {
 		pr = orig_req->pr;
 		req = orig_req->req;
 
-		XSEGLOG2(&lc, D, "Received reply for request %p", req);
-		XSEGLOG2(&lc, D, "Unpacking reply for request %p", req);
-
-		unpack_request(&sh, req);
 		req_data = xseg_get_data(peer->xseg, req);
 		req_target = xseg_get_target(peer->xseg, req);
+		XSEGLOG2(&lc, D, "Unpacking reply for target %s", req_target);
+		unpack_request(&sh, req);
 
-		XSEGLOG2(&lc, D, "Scattering rest of data (req: %p, dl: %lu, tl: %lu)",
-				req, req->datalen, req->targetlen);
-		bytes = recv_data(fd, &sh, req_data, req_target);
+		XSEGLOG2(&lc, D, "Scattering rest of data");
+		bytes = recv_data(fd, &sh, req_target, req_data);
 		if (bytes <= 0)
-			XSEGLOG2(&lc, E, "No data where transfered");
+			goto reply_fail;
+		XSEGLOG2(&lc, D, "%lu bytes were transfered", bytes);
 
 		if (req->state & XS_SERVED)
 			complete(peer, pr);
@@ -428,18 +432,16 @@ static int handle_recv(struct synapsed *syn, int fd)
 	}
 
 	/* For now, dst_port is hardcoded */
-	XSEGLOG2(&lc, D, "Get new request\n");
 	req = xseg_get_request(xseg, srcport, dstport, X_ALLOC);
 	if (!req) {
 		XSEGLOG2(&lc, W, "Cannot get request\n");
 		return -1;
 	}
 
-	XSEGLOG2(&lc, D, "Unpack request\n");
+	XSEGLOG2(&lc, D, "Unpacking request");
 	unpack_request(&sh, req);
 
 	//Allocate enough space for the data and the target's name
-	XSEGLOG2(&lc, D, "Prepare new request\n");
 	r = xseg_prep_request(xseg, req, req->targetlen, req->datalen);
 	if (r < 0) {
 		XSEGLOG2(&lc, W, "Cannot prepare request! (%lu, %llu)\n",
@@ -447,15 +449,14 @@ static int handle_recv(struct synapsed *syn, int fd)
 		goto put_xseg_request;
 	}
 
+	XSEGLOG2(&lc, D, "Scattering data");
 	req_data = xseg_get_data(peer->xseg, req);
 	req_target = xseg_get_target(peer->xseg, req);
-	XSEGLOG2(&lc, D, "Scattering data for target %s (req: %p, dl: %lu, tl: %lu)",
-			req_target, sh.orig_req.req, sh.datalen, sh.targetlen);
-	bytes = recv_data(fd, &sh, req_data, req_target);
+	bytes = recv_data(fd, &sh, req_target, req_data);
 	if (bytes <= 0)
-		XSEGLOG2(&lc, E, "No data where transfered");
+		goto accept_fail;
+	XSEGLOG2(&lc, D, "%lu bytes were transfered for target %s", bytes, req_target);
 
-	XSEGLOG2(&lc, D, "Allocate peer request\n");
 	pr = alloc_peer_req(peer);
 	if (!pr) {
 		XSEGLOG2(&lc, W, "Cannot allocate peer request (%ld remaining)\n",
@@ -495,6 +496,14 @@ put_peer_request:
 put_xseg_request:
 	if (xseg_put_request(xseg, req, srcport))
 		XSEGLOG2(&lc, W, "Cannot put request\n");
+	return -1;
+
+reply_fail:
+	fail(peer, pr);
+	return -1;
+accept_fail:
+	/* TODO: What can we do here? */
+	XSEGLOG2(&lc, E, "Failed to accept request");
 	return -1;
 }
 

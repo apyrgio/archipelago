@@ -81,10 +81,8 @@ struct synapsed_header {
 	uint32_t state;
 	uint32_t flags;
 	uint32_t targetlen;
-	xport xseg_dst_portno;
-	uint64_t offset;
-	uint64_t size;
 	uint64_t datalen;
+	uint64_t offset;
 	uint64_t serviced;
 };
 #pragma pack(pop)
@@ -105,7 +103,7 @@ int synapsed_init_local_signal(struct peerd *peer, sigset_t *oldset);
 void pack_request(struct synapsed_header *sh, struct peer_req *pr,
 		struct xseg_request *req, uint32_t sh_flags);
 void unpack_request(struct synapsed_header *sh, struct xseg_request *req);
-int recv_synapsed_header(int fd, struct synapsed_header *sh);
+ssize_t recv_synapsed_header(int fd, struct synapsed_header *sh);
 ssize_t send_data(int fd, struct synapsed_header *sh, char *target, char *data);
 ssize_t recv_data(int fd, struct synapsed_header *sh, char *target, char *data);
 

@@ -232,37 +232,31 @@ void pack_request(struct synapsed_header *sh, struct peer_req *pr,
 	orig_req->req = req;
 	orig_req->sh_flags = sh_flags;
 
-	sh->xseg_dst_portno = req->dst_portno;
 	sh->op = req->op;
 	sh->state = req->state;
 	sh->flags = req->flags;
-	sh->serviced = req->serviced;
+	sh->offset = req->offset;
 	sh->datalen = req->datalen;
 	sh->targetlen = req->targetlen;
-	sh->size = req->size;
 	sh->serviced = req->serviced;
 
-	XSEGLOG2(&lc, D, "sh: %p, req: %p, op: %lu, sh_flags: %u",
-			sh, orig_req->req, sh->op, orig_req->sh_flags);
+	print_synapsed_header(sh);
 }
 
 void unpack_request(struct synapsed_header *sh, struct xseg_request *req)
 {
-	req->dst_portno = sh->xseg_dst_portno;
 	req->op = sh->op;
 	req->state = sh->state;
 	req->flags = sh->flags;
-	req->serviced = sh->serviced;
+	req->offset = sh->offset;
 	req->datalen = sh->datalen;
 	req->targetlen = sh->targetlen;
-	req->size = sh->size;
 	req->serviced = sh->serviced;
 
-	XSEGLOG2(&lc, D, "sh: %p, req: %p, op: %lu, sh_flags: %u",
-			sh, sh->orig_req.req, req->op, sh->orig_req.sh_flags);
+	print_synapsed_header(sh);
 }
 
-ssize_t send_data(int fd, struct synapsed_header *sh, char *data, char *target)
+ssize_t send_data(int fd, struct synapsed_header *sh, char *target, char *data)
 {
 	struct iovec iov[3];
 	int iovcnt = 2;
@@ -277,7 +271,8 @@ ssize_t send_data(int fd, struct synapsed_header *sh, char *data, char *target)
 	iov[1].iov_len = sh->targetlen;
 	total += iov[1].iov_len;
 
-	if (sh->op == X_WRITE && sh->orig_req.sh_flags & SH_REQUEST) {
+	if ((sh->op == X_READ && sh->orig_req.sh_flags & SH_REPLY) ||
+			(sh->op == X_WRITE && sh->orig_req.sh_flags & SH_REQUEST)) {
 		iov[2].iov_base = data;
 		iov[2].iov_len = sh->datalen;
 		iovcnt = 3;
@@ -308,7 +303,7 @@ ssize_t send_data(int fd, struct synapsed_header *sh, char *data, char *target)
 	return written;
 
 error:
-	XSEGLOG2(&lc, E, "Gather write has failed with error %d", errno);
+	XSEGLOG2(&lc, E, "Gather write failed with error %d", errno);
 	return -1;
 }
 
@@ -322,11 +317,12 @@ ssize_t recv_data(int fd, struct synapsed_header *sh, char *target, char *data)
 	iov[0].iov_base = target;
 	iov[0].iov_len = sh->targetlen;
 	total = iov[0].iov_len;
-	if (sh->op == X_READ && sh->orig_req.sh_flags & SH_REPLY) {
+	if ((sh->op == X_READ && sh->orig_req.sh_flags & SH_REPLY) ||
+			(sh->op == X_WRITE && sh->orig_req.sh_flags & SH_REQUEST)) {
 		iov[1].iov_base = data;
 		iov[1].iov_len = sh->datalen;
 		iovcnt = 2;
-		total = iov[1].iov_len;
+		total += iov[1].iov_len;
 	}
 
 	read = 0;
@@ -355,17 +351,29 @@ ssize_t recv_data(int fd, struct synapsed_header *sh, char *target, char *data)
 	return read;
 
 error:
-	XSEGLOG2(&lc, E, "Scatter read has failed with error %d", errno);
+	XSEGLOG2(&lc, E, "Scatter read failed with error %d", errno);
 	return -1;
 }
 
-int recv_synapsed_header(int fd, struct synapsed_header *sh)
+ssize_t recv_synapsed_header(int fd, struct synapsed_header *sh)
 {
-	read(fd, sh, sizeof(struct synapsed_header));
+	ssize_t total, read, partial;
 
-	XSEGLOG2(&lc, D, "sh: %p, req: %p, op: %lu, sh_flags: %u",
-			sh, sh->orig_req.req, sh->op, sh->orig_req.sh_flags);
-	return 0;
+	read = 0;
+	partial = 0;
+	total = sizeof(struct synapsed_header);
+	while (read < total) {
+		partial = recv(fd, sh + read, total - read, 0);
+		if (partial < 0)
+			goto error;
+		read += partial;
+	}
+
+	print_synapsed_header(sh);
+	return total;
+error:
+	XSEGLOG2(&lc, E, "Synapsed header reception failed with error %d", errno);
+	return -1;
 }
 
 /********************************\
