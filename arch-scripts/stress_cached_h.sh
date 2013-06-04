@@ -37,20 +37,20 @@ usage() {
 	echo "  that they will wait in a different port."
 	echo ""
 	echo "* An easy way to check out the output would be to start 3 terminals"
-	echo "  and simply have them do: tail -F /var/log/cached* (or bench*,"
-	echo "  mt-pfiled*). Thus, when a file is rm'ed or a new file with the same"
-	echo "  prefix has been added, tail will read it and you won't have to do"
-	echo "  anything."
+	echo "  and simply have them do: tail -F /var/log/stress_cached/cached*"
+	echo "  (or bench*, mt-pfiled*). Thus, when a file is rm'ed or a new file"
+	echo "  with the sam prefix has been added, tail will read it and you won't"
+	echo "  have to do anything."
 }
 
 parse_args() {
 	# ${1} is for threads
 	if [[ ${1} = 'single' ]]; then
-		T_MTPF=1
+		T_MTPF=64
 		T_CACHED=1
 		T_BENCH=1
 	elif [[ ${1} = 'multi' ]]; then
-		T_MTPF=3
+		T_MTPF=64
 		T_CACHED=4
 		T_BENCH=1
 	else
@@ -165,7 +165,7 @@ print_test() {
 }
 
 init_log() {
-	LOG=/var/log/${1}
+	LOG=/var/log/stress_cached/${1}
 
 	# Truncate previous logs
 	cat /dev/null > $LOG
@@ -196,7 +196,9 @@ nuke_xseg() {
 	# Delete mt-pfiled files
 	find /tmp/pithos1/ -name "*" -exec rm -rf {} \;
 	find /tmp/pithos2/ -name "*" -exec rm -rf {} \;
-	mkdir /tmp/pithos1/ /tmp/pithos2/
+	mkdir -p /tmp/pithos1/
+	mkdir -p /tmp/pithos2/
+	mkdir -p /var/log/stress_cached/
 
 	# Clear previous tries
 	killall -9 bench

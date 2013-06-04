@@ -91,15 +91,15 @@ create_seed $SEED
 BENCH_COMMAND='bench -g posix:apyrgio: -p ${P} -tp 0
 			-v ${VERBOSITY} --seed ${SEED} -op ${BENCH_OP} --pattern rand
 			-ts ${BENCH_SIZE} --progress yes --iodepth ${IODEPTH} --verify meta
-			-l /var/log/bench${I}.log'
+			-l /var/log/stress_cached/bench${I}.log'
 
 CACHED_COMMAND='cached -g posix:apyrgio: -p 1 -bp 0 -t ${T_CACHED}
 			-v ${VERBOSITY} -wcp ${WCP} -n ${NR_OPS} -cs ${CACHE_SIZE}
-			-l /var/log/cached${I}.log'
+			-l /var/log/stress_cached/cached${I}.log'
 
 MT_PFILED_COMMAND='mt-pfiled -g posix:apyrgio: -p 0 -t ${T_MTPF} -v ${VERBOSITY}
 			--pithos /tmp/pithos1/ --archip /tmp/pithos2/
-			-l /var/log/mt-pfiled${I}.log'
+			-l /var/log/stress_cached/mt-pfiled${I}.log'
 
 #############
 # Main loop #
