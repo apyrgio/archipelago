@@ -256,6 +256,33 @@ void unpack_request(struct synapsed_header *sh, struct xseg_request *req)
 	print_synapsed_header(sh);
 }
 
+ssize_t recv_synapsed_header(int fd, struct synapsed_header *sh)
+{
+	ssize_t total, read, partial;
+
+	read = 0;
+	partial = 0;
+	total = sizeof(struct synapsed_header);
+	while (read < total) {
+		partial = recv(fd, sh + read, total - read, 0);
+		if (partial == 0)
+			return 0;
+		if (partial < 0) {
+			if (errno == EINTR || errno == EAGAIN) {
+				partial = 0;
+				continue;
+			}
+			goto error;
+		}
+		read += partial;
+	}
+
+	return total;
+error:
+	XSEGLOG2(&lc, E, "Synapsed header recv faild with error %d", errno);
+	return -1;
+}
+
 ssize_t send_data(int fd, struct synapsed_header *sh, char *target, char *data)
 {
 	struct iovec iov[3];
@@ -288,7 +315,7 @@ ssize_t send_data(int fd, struct synapsed_header *sh, char *target, char *data)
 
 		partial = writev(fd, iov + i, iovcnt - i);
 		if (partial < 0) {
-			if (errno == -EINTR) {
+			if (errno == EINTR || errno == EAGAIN) {
 				partial = 0;
 				continue;
 			}
@@ -296,14 +323,14 @@ ssize_t send_data(int fd, struct synapsed_header *sh, char *target, char *data)
 		}
 		written += partial;
 
-		while (i < iovcnt && partial < iov[i].iov_len)
+		while (i < iovcnt && partial >= iov[i].iov_len)
 			partial -= iov[i++].iov_len;
 	}
 
 	return written;
 
 error:
-	XSEGLOG2(&lc, E, "Gather write failed with error %d", errno);
+	XSEGLOG2(&lc, E, "Gather write failed with errno %d", errno);
 	return -1;
 }
 
@@ -336,7 +363,7 @@ ssize_t recv_data(int fd, struct synapsed_header *sh, char *target, char *data)
 		if (partial == 0)
 			return 0;	/* Connection closed? */
 		if (partial < 0) {
-			if (errno == -EINTR) {
+			if (errno == EINTR || errno == EAGAIN) {
 				partial = 0;
 				continue;
 			}
@@ -344,35 +371,14 @@ ssize_t recv_data(int fd, struct synapsed_header *sh, char *target, char *data)
 		}
 		read += partial;
 
-		while (i < iovcnt && partial < iov[i].iov_len)
+		while (i < iovcnt && partial >= iov[i].iov_len)
 			partial -= iov[i++].iov_len;
 	}
 
 	return read;
 
 error:
-	XSEGLOG2(&lc, E, "Scatter read failed with error %d", errno);
-	return -1;
-}
-
-ssize_t recv_synapsed_header(int fd, struct synapsed_header *sh)
-{
-	ssize_t total, read, partial;
-
-	read = 0;
-	partial = 0;
-	total = sizeof(struct synapsed_header);
-	while (read < total) {
-		partial = recv(fd, sh + read, total - read, 0);
-		if (partial < 0)
-			goto error;
-		read += partial;
-	}
-
-	print_synapsed_header(sh);
-	return total;
-error:
-	XSEGLOG2(&lc, E, "Synapsed header reception failed with error %d", errno);
+	XSEGLOG2(&lc, E, "Scatter read failed with errno %d", errno);
 	return -1;
 }
 
