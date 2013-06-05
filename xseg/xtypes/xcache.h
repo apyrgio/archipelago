@@ -44,9 +44,10 @@
 #include <xseg/protocol.h>
 #include <sys/util.h>
 
-#define XCACHE_LRU_ARRAY      (1<<0)
-#define XCACHE_LRU_HEAP       (1<<1)
-#define XCACHE_USE_RMTABLE    (1<<2)
+#define XCACHE_LRU_ARRAY (1<<0)
+#define XCACHE_LRU_HEAP  (1<<1)
+#define XCACHE_LRU_O1  (1<<2)
+#define XCACHE_USE_RMTABLE    (1<<3)
 
 #define XCACHE_LRU_MAX   (uint64_t)(-1)
 
@@ -101,6 +102,8 @@ struct xcache_entry {
 	uint32_t state;
 	char name[XSEG_MAX_TARGETLEN + 1];
 	xbinheap_handler h;
+	struct xcache_entry *older;	/* O(1) lru */
+	struct xcache_entry *younger;	/* O(1) lru */
 	void *priv;
 };
 
@@ -116,10 +119,23 @@ struct xcache {
 	uint64_t time;
 	uint64_t *times;
 	struct xbinheap binheap;
+	struct xcache_entry *lru;	/* O(1) lru */
+	struct xcache_entry *mru;	/* O(1) lru */
 	struct xcache_ops ops;
 	uint32_t flags;
 	void *priv;
 };
+
+/*
+ * The LRU chain goes like this:
+ * MRU <-> MRU+ <-> MRU++ <-> ... <-> LRU^^ <-> LRU^ <-> LRU
+ *
+ * where:
+ *
+ * a. MRU is the most recently used item
+ * b. LRU is the least recently used item
+ * c. "+" denotes "older than" and "^" denotes "younger than"
+ */
 
 static int __validate_idx(struct xcache *cache, xqindex idx)
 {

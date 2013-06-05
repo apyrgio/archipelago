@@ -58,6 +58,68 @@ static void __free_cache_entry(struct xcache *cache, xqindex idx)
 }
 #endif
 
+/* O(1) LRU implementation */
+
+static xqindex __get_idx(struct xcache *cache, struct xcache_entry *ce)
+{
+	return (ce - cache->nodes) / sizeof(struct xcache_entry);
+}
+
+static xqindex __pop_lru(struct xcache *cache)
+{
+	xqindex lru;
+
+	lru = __get_idx(cache, cache->lru);
+	cache->lru = cache->lru->younger;
+	cache->lru->older = NULL;
+
+	XSEGLOG("Pop ce %lu from LRU", lru);
+	return lru;
+}
+
+static void __append_mru(struct xcache *cache, struct xcache_entry *ce)
+{
+	if (cache->lru == NULL) { /* Initialize LRU if we are the first */
+		cache->mru = ce;
+		cache->lru = ce;
+		XSEGLOG("Initialize LRU. First ce is %lu", __get_idx(cache, ce));
+		return;
+	}
+
+	if (ce == cache->mru) { /* No need to update in this case */
+		XSEGLOG("Append ce %lu to MRU", __get_idx(cache, ce));
+		return;
+	}
+
+	if (ce == cache->lru)	/* There is no ce->older */
+		cache->lru = ce->younger;
+	else
+		ce->older->younger = ce->younger;
+	ce->younger->older = ce->older;
+
+	/* Put ce on top (MRU) */
+	cache->mru->younger = ce;
+	ce->younger = NULL;
+	ce->older = cache->mru;
+	cache->mru = ce;
+	XSEGLOG("Append ce %lu to MRU", __get_idx(cache, ce));
+}
+
+static void __remove_from_list(struct xcache *cache, struct xcache_entry *ce)
+{
+	if (ce == cache->mru) {
+		cache->mru = ce->older;
+		ce->older->younger = NULL;
+	} else if (ce == cache->lru) {
+		cache->lru = ce->younger;
+		ce->younger->older = NULL;
+	} else {
+		ce->younger->older = ce->older;
+		ce->older->younger = ce->younger;
+	}
+	XSEGLOG("Remove ce %lu", __get_idx(cache, ce));
+}
+
 /* table helper functions */
 static xcache_handler __table_lookup(xhash_t *table, char *name)
 {
@@ -162,6 +224,9 @@ static void __reset_times(struct xcache *cache)
 			else
 				xbinheap_decreasekey(&cache->binheap, ce->h, cache->time);
 		}
+	} else if (cache->flags & XCACHE_LRU_O1) {
+		cache->lru = NULL;
+		cache->mru = NULL;
 	}
 }
 
@@ -171,6 +236,7 @@ static void __reset_times(struct xcache *cache)
 static void __update_access_time(struct xcache *cache, xqindex idx)
 {
 	struct xcache_entry *ce = &cache->nodes[idx];
+	struct xcache_entry *ce_younger, *ce_older;
 
 	/* assert thatn cache->time does not get MAX value. If this happen,
 	 * reset it to zero, and also reset all access times.
@@ -193,6 +259,8 @@ static void __update_access_time(struct xcache *cache, xqindex idx)
 				XSEGLOG("BUG: Cannot insert to lru binary heap");
 			}
 		}
+	} else if (cache->flags & XCACHE_LRU_O1) {
+		__append_mru(cache, ce);
 	}
 }
 
@@ -228,9 +296,9 @@ static int __xcache_remove_entries(struct xcache *cache, xcache_handler h)
 		return r;
 	}
 
-	if (cache->flags & XCACHE_LRU_ARRAY)
+	if (cache->flags & XCACHE_LRU_ARRAY) {
 		cache->times[idx] = XCACHE_LRU_MAX;
-	else if (cache->flags & XCACHE_LRU_HEAP) {
+	} else if (cache->flags & XCACHE_LRU_HEAP) {
 		if (ce->h != NoNode) {
 			if (xbinheap_increasekey(&cache->binheap, ce->h, XCACHE_LRU_MAX) < 0){
 				XSEGLOG("BUG: cannot increase key to XCACHE_LRU_MAX");
@@ -240,6 +308,8 @@ static int __xcache_remove_entries(struct xcache *cache, xcache_handler h)
 			}
 			ce->h = NoNode;
 		}
+	} else if (cache->flags & XCACHE_LRU_O1) {
+		__remove_from_list(cache, ce);
 	}
 	//XSEGLOG("cache->times[%llu] = %llu", idx, cache->times[idx]);
 	return 0;
@@ -415,6 +485,8 @@ static xqindex __xcache_lru(struct xcache *cache)
 			return Noneidx;
 		ce = &cache->nodes[lru];
 		ce->h = NoNode;
+	} else if (cache->flags & XCACHE_LRU_O1) {
+		__pop_lru(cache);
 	}
 	return lru;
 }
@@ -776,12 +848,16 @@ int xcache_init(struct xcache *cache, uint32_t xcache_size,
 				goto out_free_times;
 		}
 	}
-	if (flags & XCACHE_LRU_HEAP){
+	if (flags & XCACHE_LRU_HEAP) {
 		if (xbinheap_init(&cache->binheap, cache->size, XBINHEAP_MIN,
 					NULL) < 0){
 			goto out_free_times;
 		}
 	}
+	if (flags & XCACHE_LRU_O1) {
+		cache->lru = NULL;
+	}
+
 
 	return 0;
 
