@@ -965,9 +965,7 @@ int main(int argc, const char *argv[])
 	int t = atoi(argv[3]);
 	int n = atoi(argv[4]);
 
-	lru = XCACHE_LRU_ARRAY;
-	if (lru_type)
-		lru = XCACHE_LRU_HEAP;
+	lru = lru_type;
 
 	fprintf(stderr, "Running test1\n");
 	gettimeofday(&start, NULL);

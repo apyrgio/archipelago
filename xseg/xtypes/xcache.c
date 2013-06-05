@@ -62,32 +62,42 @@ static void __free_cache_entry(struct xcache *cache, xqindex idx)
 
 static xqindex __get_idx(struct xcache *cache, struct xcache_entry *ce)
 {
-	return (ce - cache->nodes) / sizeof(struct xcache_entry);
+	return (ce - cache->nodes);
 }
 
 static xqindex __pop_lru(struct xcache *cache)
 {
 	xqindex lru;
+	struct xcache_entry *ce;
 
 	lru = __get_idx(cache, cache->lru);
 	cache->lru = cache->lru->younger;
 	cache->lru->older = NULL;
 
-	XSEGLOG("Pop ce %lu from LRU", lru);
+	ce = &cache->nodes[lru];
+	ce->younger = NULL;
+	ce->older = NULL;
+
 	return lru;
 }
 
 static void __append_mru(struct xcache *cache, struct xcache_entry *ce)
 {
-	if (cache->lru == NULL) { /* Initialize LRU if we are the first */
+	/* Initialize LRU if we are the first */
+	if (cache->lru == NULL) {
 		cache->mru = ce;
 		cache->lru = ce;
-		XSEGLOG("Initialize LRU. First ce is %lu", __get_idx(cache, ce));
+		return;
+	}
+
+	if (ce->younger == NULL && ce->younger == NULL) {
+		ce->older = cache->mru;
+		cache->mru->younger = ce;
+		cache->mru = ce;
 		return;
 	}
 
 	if (ce == cache->mru) { /* No need to update in this case */
-		XSEGLOG("Append ce %lu to MRU", __get_idx(cache, ce));
 		return;
 	}
 
@@ -102,11 +112,14 @@ static void __append_mru(struct xcache *cache, struct xcache_entry *ce)
 	ce->younger = NULL;
 	ce->older = cache->mru;
 	cache->mru = ce;
-	XSEGLOG("Append ce %lu to MRU", __get_idx(cache, ce));
 }
 
 static void __remove_from_list(struct xcache *cache, struct xcache_entry *ce)
 {
+	/* Check if entry has already been removed */
+	if (ce->younger == NULL && ce->older == NULL)
+		return;
+
 	if (ce == cache->mru) {
 		cache->mru = ce->older;
 		ce->older->younger = NULL;
@@ -117,7 +130,8 @@ static void __remove_from_list(struct xcache *cache, struct xcache_entry *ce)
 		ce->younger->older = ce->older;
 		ce->older->younger = ce->younger;
 	}
-	XSEGLOG("Remove ce %lu", __get_idx(cache, ce));
+	ce->younger = NULL;
+	ce->older = NULL;
 }
 
 /* table helper functions */
@@ -236,7 +250,6 @@ static void __reset_times(struct xcache *cache)
 static void __update_access_time(struct xcache *cache, xqindex idx)
 {
 	struct xcache_entry *ce = &cache->nodes[idx];
-	struct xcache_entry *ce_younger, *ce_older;
 
 	/* assert thatn cache->time does not get MAX value. If this happen,
 	 * reset it to zero, and also reset all access times.
@@ -344,6 +357,7 @@ static xcache_handler __xcache_lookup_rm(struct xcache *cache, char *name)
 	return __table_lookup(cache->rm_entries, name);
 }
 
+__attribute__ ((unused))
 static xcache_handler __xcache_lookup_and_get_rm(struct xcache *cache, char *name)
 {
 	xcache_handler h;
@@ -486,7 +500,7 @@ static xqindex __xcache_lru(struct xcache *cache)
 		ce = &cache->nodes[lru];
 		ce->h = NoNode;
 	} else if (cache->flags & XCACHE_LRU_O1) {
-		__pop_lru(cache);
+		lru = __pop_lru(cache);
 	}
 	return lru;
 }
@@ -856,8 +870,13 @@ int xcache_init(struct xcache *cache, uint32_t xcache_size,
 	}
 	if (flags & XCACHE_LRU_O1) {
 		cache->lru = NULL;
+		cache->mru = NULL;
+		for (i = 0; i < cache->nr_nodes; i++) {
+			ce = &cache->nodes[i];
+			ce->younger = NULL;
+			ce->older = NULL;
+		}
 	}
-
 
 	return 0;
 

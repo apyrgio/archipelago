@@ -142,6 +142,8 @@ static int __validate_idx(struct xcache *cache, xqindex idx)
 /*
  * Return a pointer to the associated cache entry.
  */
+
+__attribute__ ((unused))
 static void *xcache_get_entry(struct xcache *cache, xcache_handler h)
 {
 	xqindex idx = (xqindex)h;
@@ -156,6 +158,7 @@ static void *xcache_get_entry(struct xcache *cache, xcache_handler h)
  * Return a pointer to a NULL terminated string holding the name of the
  * associated cache entry.
  */
+__attribute__ ((unused))
 static char *xcache_get_name(struct xcache *cache, xcache_handler h)
 {
 	xqindex idx = (xqindex)h;
