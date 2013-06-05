@@ -76,7 +76,6 @@ static xqindex __pop_lru(struct xcache *cache)
 		cache->lru = NULL;
 		ce->younger = NULL;
 		ce->older = NULL;
-	XSEGLOG("Evicted %lu", __get_idx(cache, ce));
 		return lru;
 	}
 	cache->lru = cache->lru->younger;
@@ -86,7 +85,6 @@ static xqindex __pop_lru(struct xcache *cache)
 	ce->younger = NULL;
 	ce->older = NULL;
 
-	XSEGLOG("Evicted %lu", __get_idx(cache, ce));
 	return lru;
 }
 
@@ -96,7 +94,6 @@ static void __append_mru(struct xcache *cache, struct xcache_entry *ce)
 	if (cache->lru == NULL) {
 		cache->mru = ce;
 		cache->lru = ce;
-	XSEGLOG("Appended %lu to mru (new lru)", __get_idx(cache, ce));
 		return;
 	}
 
@@ -104,7 +101,6 @@ static void __append_mru(struct xcache *cache, struct xcache_entry *ce)
 		ce->older = cache->mru;
 		cache->mru->younger = ce;
 		cache->mru = ce;
-	XSEGLOG("Appended %lu to mru (first-time)", __get_idx(cache, ce));
 		return;
 	}
 
@@ -123,7 +119,6 @@ static void __append_mru(struct xcache *cache, struct xcache_entry *ce)
 	ce->younger = NULL;
 	ce->older = cache->mru;
 	cache->mru = ce;
-	XSEGLOG("Appended %lu to mru", __get_idx(cache, ce));
 }
 
 static void __remove_from_list(struct xcache *cache, struct xcache_entry *ce)
@@ -149,7 +144,6 @@ static void __remove_from_list(struct xcache *cache, struct xcache_entry *ce)
 	}
 	ce->younger = NULL;
 	ce->older = NULL;
-	XSEGLOG("Removed %lu\n", __get_idx(cache, ce));
 }
 
 /* table helper functions */
