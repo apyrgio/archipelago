@@ -720,15 +720,6 @@ int on_evict(void *c, void *e)
 	return 0;
 }
 
-int post_evict(void *c, void *e)
-{
-	struct ce *ce = (struct ce *)e;
-	struct cache_io *ce_cio = ce->pr.priv;
-
-	XSEGLOG2(&lc, I, "Moving cache entry %p (h: %lu) in rm entries", ce, ce_cio->h);
-	return 1;
-}
-
 int on_finalize(void *c, void *e)
 {
 	struct peerd *peer = (struct peerd *)c;
@@ -780,7 +771,6 @@ struct xcache_ops c_ops = {
 	.on_init = on_init,
 	.on_evict = on_evict,
 	.on_finalize = on_finalize,
-	.post_evict = post_evict,
 	.on_reinsert = on_reinsert,
 	.on_put = NULL,
 	.on_free  = on_free,
@@ -1856,7 +1846,8 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	cached->buckets_per_object = cached->object_size / cached->bucket_size;
 
 	/* Initialize xcache and queues */
-	xcache_init(cached->cache, cached->cache_size, &c_ops, XCACHE_LRU_HEAP, peer);
+	xcache_init(cached->cache, cached->cache_size,
+			&c_ops, XCACHE_LRU_HEAP | XCACHE_USE_RMTABLE, peer);
 	cached->cache_size = cached->cache->size; /* cache size may have changed if
 											     not power of 2 */
 	if (cached->cache_size < peer->nr_ops){
