@@ -932,22 +932,23 @@ int test3(unsigned long cache_size, unsigned long nr_threads)
 
 void usage()
 {
-	fprintf(stdout, "Usage: ./xcache_test <cache_size> <lru> <nr_threads> <n>\n"
-			"----------------------------------------------------------\n"
-			"[test1]\tLookup in cold cache if any entry is there. There must be "
-			"none.\n\tThen, insert <cache_size> entries in cache and check for "
-			"errors.\n\tLookup these new entries and verify that they're "
-			"in cache.\n\tFinally, close the cache.\n"
-			"\n"
-			"[test2]\tCreate <nr_threads> threads and assign the work of test1 "
-			"to them.\n\tThese threads greedily try to compete for every "
-			" xcache_* operation of test1,\n\twhile trying to insert exactly "
-			"the same number of entries.\n\tThe sole synchronization "
-			"between threads are two barriers and some atomic operations,\n\t"
-			"so it is a good indication of how well xcache scales.\n"
-			"\n"
-			"[test3]\tCreate <nr_threads> threads and order each of them to do "
-			"<n> insertions in cache.\n");
+	fprintf(stdout,
+		"Usage: ./xcache_test <cache_size> <lru> <nr_threads> <n>\n"
+		"----------------------------------------------------------\n"
+		"[test1]\tLookup in cold cache if any entry is there. There must be "
+		"none.\n\tThen, insert <cache_size> entries in cache and check for "
+		"errors.\n\tLookup these new entries and verify that they're "
+		"in cache.\n\tFinally, close the cache.\n"
+		"\n"
+		"[test2]\tCreate <nr_threads> threads and assign the work of test1 "
+		"to them.\n\tThese threads greedily try to compete for every "
+		" xcache_* operation of test1,\n\twhile trying to insert exactly "
+		"the same number of entries.\n\tThe sole synchronization "
+		"between threads are two barriers and some atomic operations,\n\t"
+		"so it is a good indication of how well xcache scales.\n"
+		"\n"
+		"[test3]\tCreate <nr_threads> threads and order each of them to do "
+		"<n> insertions in cache.\n");
 }
 
 int main(int argc, const char *argv[])
@@ -965,6 +966,20 @@ int main(int argc, const char *argv[])
 	int t = atoi(argv[3]);
 	int n = atoi(argv[4]);
 
+	switch (lru_type) {
+		case XCACHE_LRU_ARRAY:
+			printf("LRU is Array\n");
+			break;
+		case XCACHE_LRU_HEAP:
+			printf("LRU is Heap\n");
+			break;
+		case XCACHE_LRU_O1:
+			printf("LRU is O(1)\n");
+			break;
+		default:
+			fprintf(stderr, "Wrong LRU type. Exiting...\n");
+			return -1;
+	}
 	lru = lru_type;
 
 	fprintf(stderr, "Running test1\n");
@@ -991,6 +1006,7 @@ int main(int argc, const char *argv[])
 	}
 	fprintf(stderr, "test2: PASSED\n");
 
+	XSEGLOG("Starting new test");
 	fprintf(stderr, "running test3\n");
 	gettimeofday(&start, NULL);
 	r = test3(cache_size, t);
