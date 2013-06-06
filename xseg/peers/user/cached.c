@@ -49,13 +49,39 @@
 
 #define MAX_ARG_LEN 12
 
-/* bucket statuses */
-#define BUCKET_STATUSES 5
-#define INVALID 0
-#define LOADING 1
-#define VALID   2
-#define DIRTY   3
-#define WRITING 4
+/* bucket statuses
+ *
+ * Allocation status occupies 1st-2nd flag bit.
+ * Data status occupied 2nd-4th flag bit.
+ */
+
+#define BUCKET_ALLOC_STATUSES 3
+#define ALLOC_STATUS_FLAG_POS 0
+#define ALLOC_STATUS_BITMASK 2
+#define UNCLAIMED 0
+#define CLAIMING  1
+#define CLAIMED   2
+
+#define BUCKET_DATA_STATUSES 5
+#define DATA_STATUS_FLAG_POS 2
+#define DATA_STATUS_BITMASK 3
+#define INVALID   0
+#define LOADING   1
+#define VALID     2
+#define DIRTY     3
+#define WRITING   4
+
+/*
+ * Find position of flag, make it zero, get requested flag value, store it to
+ * this position
+ */
+#define SET_FLAG(__ftype, __flag, __val)	\
+	__flag = (__flag & ~(__ftype##_BITMASK << __ftype##_FLAG_POS)) | \
+	(__val << __ftype##_FLAG_POS);
+
+/* Apply bitmask to flags, shift result to the right to get correct value */
+#define GET_FLAG(__ftype, __flag)			\
+	(__flag & (__ftype##_BITMASK << __ftype##_FLAG_POS)) >> __ftype##_FLAG_POS
 
 /* write policies */
 #define WRITETHROUGH 1
@@ -101,14 +127,23 @@ struct cached {
 	int write_policy;
 	struct xworkq workq;
 	struct xwaitq pending_waitq;
+	unsigned char *bucket_data;
+	struct xq bucket_idx;
 	//scheduler
 };
+
+struct bucket {
+	xqindex data;
+	uint32_t flags;
+}
 
 struct ce {
 	unsigned char *data;
 	uint32_t *bucket_status;	/* bucket_status of each bucket */
 	uint32_t status;		/* cache entry status */
-	uint32_t *bucket_status_counters;
+	uint32_t *bucket_alloc_status_counters;
+	uint32_t *bucket_data_status_counters;
+	struct bucket *buckets;
 	struct xlock lock;		/* cache entry lock */
 	struct xworkq workq;		/* workq of the cache entry */
 	struct xworkq deferred_workq;		/* async workq for TODO */
@@ -160,13 +195,66 @@ static inline int __is_handler_valid(xcache_handler h)
 	return h != NoEntry;
 }
 
-static inline int __is_bucket_readable(uint32_t bucket_status)
+/* Bucket specific operations */
+static inline unsigned char *__get_bucket_data(struct bucket *b)
 {
+	return (unsigned char *)b->idx;
+}
+
+static inline int __get_bucket_alloc_status(struct bucket *b)
+{
+	return GET_FLAG(BUCKET_ALLOC_STATUS, b->flags);
+}
+
+static inline int __get_bucket_data_status(struct bucket *b)
+{
+	return GET_FLAG(BUCKET_DATA_STATUS, b->flags);
+}
+
+static inline void __set_bucket_alloc_status(struct bucket *b, int new_status)
+{
+	int old_status = __get_bucket_alloc_status(b);
+
+	ce->bucket_alloc_status_counters[old_status]--;
+	ce->bucket_alloc_status_counters[new_status]++;
+	SET_FLAG(BUCKET_ALLOC_STATUS, b->flags, new_status);
+}
+
+static inline void __set_bucket_data_status(struct bucket *b, int new_status)
+{
+	int old_status = __get_bucket_data_status(b);
+
+	ce->bucket_data_status_counters[old_status]--;
+	ce->bucket_data_status_counters[new_status]++;
+	SET_FLAG(BUCKET_DATA_STATUS, b->flags, new_status);
+}
+
+static inline void __set_bucket_data_status_range(struct ce *ce,
+		uint32_t start_bucket, uint32_t end_bucket, int new_status)
+{
+	struct bucket *b;
+	uint32_t i;
+
+	for (i = start_bucket; i <= end_bucket; i++) {
+		b = &ce->buckets[i];
+		__set_bucket_data_status(b, new_status);
+	}
+}
+
+static inline int __is_bucket_readable(struct bucket *b)
+{
+	int bucket_status = __get_bucket_data_status(b);
 	return (bucket_status == VALID ||
 		bucket_status == DIRTY ||
 		bucket_status == WRITING);
 }
 
+static inline int __is_bucket_claimed(struct bucket *b)
+{
+	return __get_bucket_alloc_status(b) == CLAIMED;
+}
+
+#if 0
 static inline void __update_bucket_status_counters(struct ce *ce,
 		uint32_t bucket, uint32_t new_status)
 {
@@ -175,6 +263,7 @@ static inline void __update_bucket_status_counters(struct ce *ce,
 	ce->bucket_status_counters[old_status]--;
 	ce->bucket_status_counters[new_status]++;
 }
+#endif
 
 static uint32_t __get_bucket(struct cached *cache, uint64_t offset)
 {
@@ -186,14 +275,19 @@ static uint32_t __get_last_per_status(struct ce *ce, uint32_t start,
 {
 	struct peerd *peer = ce->pr.peer;
 	struct cached *cached = __get_cached(peer);
+	struct bucket *b;
 	uint32_t end = start + 1;
 	uint32_t upper_bound;
 
 	upper_bound = start + (cached->max_req_size / cached->bucket_size) - 1;
 	limit = upper_bound < limit ? upper_bound : limit;
 
-	while (end <= limit && ce->bucket_status[end] == status)
+	while (end <= limit) {
+		b = &ce->buckets[end];
+		if (__get_bucket_data_status(b) != status)
+			break;
 		end++;
+	}
 
 	return end - 1;
 }
@@ -208,25 +302,105 @@ static uint32_t __get_last_dirty(struct ce *ce, uint32_t start, uint32_t limit)
 	return __get_last_per_status(ce, start, limit, DIRTY);
 }
 
+static int claim_bucket(struct ce *ce, uint32_t bucket_no)
+{
+	struct peerd *peer = ce->pr.peer;
+	struct cached *cached = __get_cached(peer);
+	struct bucket *b = &ce->buckets[bucket_no];
+	int status;
+	xqindex idx;
+
+	status = __get_bucket_alloc_status(b);
+	if (status != UNCLAIMED) {
+		XSEGLOG2(&lc, E, "BUG: Bucket %u of ce %p has state %d",
+				bucket_no, ce, status);
+		return status;
+	}
+
+	idx = xq_pop_head(cached->bucket_idx, 1);
+	if (idx == Noneidx) {
+		XSEGLOG2(&lc, E, "Could not claim bucket");
+		return -1;
+	}
+
+	__set_bucket_alloc_status(b, CLAIMED);
+	b->data = idx * cached->bucket_size;
+
+	return 0;
+}
+
+static int claim_bucket_range(struct ce *ce,
+		uint32_t start_bucket, uint32_t end_bucket)
+{
+	uint32_t i;
+	int r = 0;
+
+	for (i = start_bucket; i <= end_bucket && r == 0; i++)
+		r = claim_bucket(cached, ce, i);
+#if 0
+	if (r != 0)
+		/* return error and bucket simultaneously */
+#endif
+}
+
+static void rw_bucket(struct bucket *b, int op, unsigned char *data,
+		uint64_t offset, uint64_t size)
+{
+	if (op == X_WRITE) {
+		to = __get_bucket_data(b) + offset;
+		from = data;
+	} else if (op == X_READ) {
+		to = data;
+		from = __get_bucket_data(b) + offset;
+	}
+	memcpy(to, from, size);
+}
+
+static void rw_bucket_range(struct ce *ce, int op, unsigned char *data,
+		uint64_t offset, uint64_t size)
+{
+	struct peerd *peer = ce->pr.peer;
+	struct cached *cached = __get_cached(peer);
+	struct bucket *b;
+	unsigned char *bucket_data;
+	uint64_t bucket_offset, data_size;
+	uint32_t i;
+
+	start_bucket = __get_bucket(cached, offset);
+	end_bucket = __get_bucket(cached, offset + size - 1);
+
+	for (i = start_bucket; i <= end_bucket; i++) {
+		b = &ce->buckets[i];
+		/*
+		 * 1. Calculate offset inside bucket
+		 * 2. Do not write more than bucket size (data_size)
+		 */
+		bucket_offset = offset % cached->bucket_size;
+		data_size = bucket_offset + size < cached->bucket_size ?
+			size : cached->bucket_size - bucket_offset;
+
+		rw_bucket(b, op, data, bucket_offset, data_size);
+
+		size -= data_size;
+		offset -= bucket_offset;
+	}
+
+	if (size > 0 || offset > 0)
+		XSEGLOG2(&lc, E, "Read/write error");
+}
+
 static int cache_not_full(void *arg)
 {
 	struct cached *cached = (struct cached *)arg;
 	return xcache_free_nodes(cached->cache) > 0;
 }
 
-static void __set_bucket_status(struct ce *ce, uint32_t b, uint32_t new_status)
+static int all_buckets_claimed(void *arg)
 {
-	__update_bucket_status_counters(ce, b, new_status);
-	ce->bucket_status[b] = new_status;
-}
+	struct ce *ce = (struct ce *)arg;
+	uint32_t *bac = ce->bucket_alloc_status_counters;
 
-static void __set_bucket_status_range(struct ce *ce, uint32_t start,
-		uint32_t end, uint32_t new_status)
-{
-	uint32_t i;
-
-	for (i = start; i <= end; i++)
-		__set_bucket_status(ce, i, new_status);
+	return bac[CLAIMING] == 0;
 }
 
 static void __print_bc(uint32_t *bc) {
@@ -369,7 +543,8 @@ static int serve_req(struct peerd *peer, struct peer_req *pr)
 	req->serviced = req->size;
 
 	//assert req->serviced <= req->datalen
-	memcpy(req_data, ce->data + req->offset, req->serviced);
+	//memcpy(req_data, ce->data + req->offset, req->serviced);
+	rw_bucket_range(ce, X_READ, req_data, req->offset, req->size);
 	XSEGLOG2(&lc, D, "Finished\n");
 
 	return 0;
@@ -436,6 +611,8 @@ static void cached_fake_complete(struct peerd *peer, struct peer_req *pr)
  * Associate the request with the given pr.
  *
  */
+
+/* FIXME: rw_range must use the new way of data */
 static int rw_range(struct peerd *peer, struct peer_req *pr, uint32_t op,
 		uint32_t start, uint32_t end)
 {
@@ -488,7 +665,7 @@ static int rw_range(struct peerd *peer, struct peer_req *pr, uint32_t op,
 
 	if (req->op == X_WRITE) {
 		 req_data = xseg_get_data(xseg, req);
-		 memcpy(req_data, ce->data + req->offset, req->size);
+		 //memcpy(req_data, ce->data + req->offset, req->size);
 	}
 
 	/* Set request data */
@@ -523,12 +700,14 @@ static void flush_dirty_buckets(struct cached *cached, struct peer_req *pr)
 	struct peerd *peer = pr->peer;
 	struct cache_io *cio = pr->priv;
 	struct ce *ce = xcache_get_entry(cached->cache, cio->h);
+	struct bucket *b;
 	uint32_t end = cached->buckets_per_object - 1;
 	uint32_t i, first_dirty, last_dirty;
 
 	/* write all dirty buckets */
-	for (i = 0; i <= end; i++){
-		if (ce->bucket_status[i] != DIRTY)
+	for (i = 0; i <= end && cio->pending_reqs < 13; i++) {
+		b = &ce->buckets[i];
+		if (__get_bucket_data_status(b) != DIRTY)
 			continue;
 
 		first_dirty = i;
@@ -632,20 +811,25 @@ void *init_node(void *c, void *xh)
 	struct cached *cached = peer->priv;
 	struct cache_io *ce_cio;
 	struct ce *ce;
+	uint32_t *bac;
+	uint32_t *bdc;
 
 	ce = malloc(sizeof(struct ce));
 	if (!ce)
 		goto ce_fail;
 
-	memset(ce, 0, sizeof(struct ce)); /* Clear the struct from junk values */
-
+	memset(ce, 0, sizeof(struct ce)); /* Clear the struct from junk values yy*/
 	xlock_release(&ce->lock);
-	ce->data = malloc(sizeof(unsigned char) * cached->object_size);
-	ce->bucket_status = malloc(sizeof(uint32_t) * cached->buckets_per_object);
-	ce->bucket_status_counters = malloc(sizeof(uint32_t) * BUCKET_STATUSES);
+
+	ce->buckets = calloc(cached->buckets_per_object, sizeof(struct bucket));
+ 	bac = ce->bucket_alloc_status_counters;
+	bac = calloc(BUCKET_ALLOC_STATUSES, sizeof(uint32_t));
+ 	bdc = ce->bucket_data_status_counters;
+	bac = calloc(BUCKET_DATA_STATUSES, sizeof(uint32_t));
+
 	ce->pr.priv = malloc(sizeof(struct cache_io));
 
-	if (!ce->data || !ce->bucket_status || !ce->bucket_status_counters || !ce->pr.priv)
+	if (!ce->buckets || !bac || !bdc || !ce->pr.priv)
 		goto ce_fields_fail;
 
 	ce->pr.peer = peer;
@@ -656,11 +840,12 @@ void *init_node(void *c, void *xh)
 
 	xworkq_init(&ce->workq, &ce->lock, 0);
 	xworkq_init(&ce->deferred_workq, &ce->lock, 0);
-
+	//waitq_init(&ce->bucket_waitq, all_buckets_claimed, ce, 0)
 	return ce;
 
+	/* BFIXME: This is not complete */
 ce_fields_fail:
-	free(ce->data);
+	free(ce->buckets);
 	free(ce->bucket_status);
 	free(ce->bucket_status_counters);
 	free(ce);
@@ -815,6 +1000,7 @@ static void handle_read(void *q, void *arg)
 	uint32_t i, first_invalid, last_invalid;
 	uint32_t loading_buckets = 0;
 	uint32_t pending_requests = 0;
+	uint32_t status;
 
 	XSEGLOG2(&lc, D, "Started for %p (h: %lu, pr: %p)", ce, cio->h, pr);
 
@@ -826,17 +1012,38 @@ static void handle_read(void *q, void *arg)
 	start_bucket = __get_bucket(cached, req->offset);
 	end_bucket = __get_bucket(cached, req->offset + req->size - 1);
 	if (end_bucket > cached->buckets_per_object) {
-		XSEGLOG2(&lc, W, "Request exceeds object's bucket range (%lu)", end_bucket);
+		XSEGLOG2(&lc, W, "Request exceeds object's bucket range (%lu)",
+				end_bucket);
 		end_bucket = cached->buckets_per_object;
 	}
 	XSEGLOG2(&lc, D, "Start: %lu, end %lu for ce: %p", start_bucket, end_bucket);
 
+	/*
+	 * BTODO:
+	 * If bucket status is UNCLAIMED, claim bucket
+	 * If bucket status is CLAIMING, wait on bucket waitq
+	 * If bucket status is CLAIMED, carry on
+	 */
+	for (i = start_bucket; i <= end_bucket; i++) {
+		b = &ce->buckets[i];
+		status = __get_bucket_alloc_status(b);
+
+		if (status == UNCLAIMED) {
+			claim_bucket(ce, i);
+		} else if (status == CLAIMING) {
+			XSEGLOG2(&lc, E, "Bucket %u is being claimed", i);
+		}
+	}
+
 	/* Issue read requests to blocker for invalid buckets */
 	for (i = start_bucket; i <= end_bucket; i++) {
-		if (__is_bucket_readable(ce->bucket_status[i]))
+		b = &ce->buckets[i];
+
+		if (__is_bucket_readable(b))
 			continue;
 
-		if (ce->bucket_status[i] == INVALID) {
+		status = __get_bucket_data_status(b);
+		if (status == INVALID) {
 			XSEGLOG2(&lc, D, "Found invalid bucket %lu", i);
 			first_invalid = i;
 			last_invalid = __get_last_invalid(ce, first_invalid, end_bucket);
@@ -847,7 +1054,8 @@ static void handle_read(void *q, void *arg)
 				break;
 			}
 
-			__set_bucket_status_range(ce, first_invalid, last_invalid, LOADING);
+			__set_bucket_data_status_range(ce, first_invalid,
+					last_invalid, LOADING);
 			cio->pending_reqs++;
 			cio->state =  CIO_READING;
 			pending_requests++;
@@ -924,6 +1132,7 @@ static void handle_write(void *q, void *arg)
 	struct cache_io *cio = __get_cache_io(pr);
 	struct ce *ce = xcache_get_entry(cached->cache, cio->h);
 	struct xseg_request *req = pr->req;
+	struct bucket *b;
 
 	char *req_data;
 	uint32_t start_bucket, end_bucket, last_read_bucket = -1;
@@ -941,27 +1150,49 @@ static void handle_write(void *q, void *arg)
 	end_bucket = __get_bucket(cached, req->offset + req->size - 1);
 
 	/*
+	 * BTODO:
+	 * If bucket status is UNCLAIMED, claim bucket
+	 * If bucket status is CLAIMING, wait on bucket waitq
+	 * If bucket status is CLAIMED, carry on
+	 */
+	for (i = start_bucket; i <= end_bucket; i++) {
+		b = &ce->buckets[i];
+		status = __get_bucket_alloc_status(b);
+
+		if (status == UNCLAIMED) {
+			claim_bucket(ce, i);
+		} else if (status == CLAIMING) {
+			XSEGLOG2(&lc, E, "Bucket %u is being claimed", i);
+		}
+	}
+
+
+	/*
 	 * In case of a misaligned write, if the start, end buckets of the write
 	 * are invalid, we have to read them before continuing with the write.
 	 * FIXME 2: If loading?
 	 */
-	if (ce->bucket_status[start_bucket] == INVALID && first_bucket_offset) {
+	b = &ce->buckets[start_bucket];
+	start_bucket_status = __get_bucket_data_status(b);
+	if (start_bucket_status == INVALID && first_bucket_offset) {
 		if (rw_range(peer, pr, X_READ, start_bucket, start_bucket) < 0) {
 			cio->state = CIO_FAILED;
 			goto out;
 		}
-		__set_bucket_status(ce, start_bucket, LOADING);
+		__set_bucket_data_status(b, LOADING);
 		cio->pending_reqs++;
 		cio->state = CIO_WRITING;
 		last_read_bucket = start_bucket;
 	}
 
-	if (ce->bucket_status[end_bucket] == INVALID && last_bucket_offset) {
+	b = &ce->buckets[end_bucket];
+	end_bucket_status = __get_bucket_data_status(b);
+	if (end_bucket_status == INVALID && last_bucket_offset) {
 		if (rw_range(peer, pr, X_READ, end_bucket, end_bucket) < 0) {
 			cio->state = CIO_FAILED;
 			goto out;
 		}
-		__set_bucket_status(ce, end_bucket, LOADING);
+		__set_bucket_data_status(b, LOADING);
 		cio->pending_reqs++;
 		cio->state = CIO_WRITING;
 		last_read_bucket = end_bucket;
@@ -984,8 +1215,8 @@ static void handle_write(void *q, void *arg)
 		cio->pending_reqs++;
 	} else if (cached->write_policy == WRITEBACK) {
 		req_data = xseg_get_data(peer->xseg, pr->req);
-		memcpy(ce->data + req->offset, req_data, req->size);
-		__set_bucket_status_range(ce, start_bucket, end_bucket, DIRTY);
+		rw_bucket_range(ce, X_WRITE, req_data, offset, size);
+		__set_bucket_data_status_range(ce, start_bucket, end_bucket, DIRTY);
 		req->state |= XS_SERVED;
 		req->serviced = req->size;
 	} else {
@@ -1150,6 +1381,7 @@ static void complete_read(void *q, void *arg)
 	struct cached *cached = __get_cached(peer);
 	struct cache_io *cio = __get_cache_io(pr);
 	struct ce *ce = xcache_get_entry(cached->cache, cio->h);
+	struct bucket *b;
 	char *data = xseg_get_data(peer->xseg, req);
 	uint32_t start, start_unserviced, end_size, i;
 	int success;
@@ -1198,23 +1430,27 @@ static void complete_read(void *q, void *arg)
 
 	/* Check serviced buckets */
 	for (i = start; i < start_unserviced; i++) {
-		if (ce->bucket_status[i] != LOADING)
+		b = &ce->buckets[i];
+		if (__get_bucket_data_status(b) != LOADING)
 			continue;
 
 		XSEGLOG2(&lc, D, "Bucket %lu loading and reception successful", i);
-		memcpy(ce->data + (i * cached->bucket_size),
-				data + (i - start) * cached->bucket_size,
-				cached->bucket_size);
-		__set_bucket_status(ce, i, VALID);
+		b = &ce->buckets[i];
+
+		rw_bucket(b, X_WRITE, data, 0, cached->bucket_size);
+
+		data += cached->bucket_size;
+		__set_bucket_data_status(b, VALID);
 	}
 
 	/* Check non-serviced buckets */
 	for (i = start_unserviced; i <= end_size; i++) {
-		if (ce->bucket_status[i] != LOADING)
+		b = &ce->buckets[i];
+		if (__get_bucket_data_status(b) != LOADING)
 			continue;
 
 		XSEGLOG2(&lc, D, "Bucket %lu loading but reception unsuccessful", i);
-		__set_bucket_status(ce, i, INVALID);
+		__set_bucket_status(b, INVALID);
 	}
 
 out:
@@ -1271,9 +1507,10 @@ static void complete_write_through(struct peerd *peer, struct peer_req *pr,
 	if (req->serviced) {
 		start = __get_bucket(cached, req->offset);
 		req_data = xseg_get_data(peer->xseg, req);
-		memcpy(ce->data + req->offset, req_data, req->serviced);
+		//memcpy(ce->data + req->offset, req_data, req->serviced);
+		rw_bucket_range(ce, X_WRITE, req_data, req->offset, req->size);
 		end_serviced = __get_bucket(cached, req->offset + req->serviced - 1);
-		__set_bucket_status_range(ce, start, end_serviced, VALID);
+		__set_bucket_data_status_range(ce, start, end_serviced, VALID);
 	}
 
 out:
@@ -1321,8 +1558,9 @@ static void complete_write_back(struct peerd *peer, struct peer_req *pr,
 	end = __get_bucket(cached, req->offset + req->size - 1);
 
 	for (i = start; i <= end; i++) {
-		if (ce->bucket_status[i] == WRITING)
-			__set_bucket_status(ce, i, VALID);
+		b = &ce->buckets[i];
+		if (__get_bucket_data_status(b) == WRITING)
+			__set_bucket_data_status(b, VALID);
 	}
 
 out:
@@ -1844,12 +2082,23 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	/*** End of parsing ***/
 
 	cached->buckets_per_object = cached->object_size / cached->bucket_size;
+	cached->bucket_data = malloc(cached->object_size * cache->size);
+	if (!cached->bucket_data) {
+		XSEGLOG2(&lc, E, "Cannot allocate enough space for bucket data");
+		goto cio_fail;
+	}
+	if (!xq_alloc_seq(&cached->bucket_idx,
+				cached->object_size * cache->size,
+				cached->object_size * cache->size)){
+		XSEGLOG2(&lc, E, "Cannot create bucket index");
+		return -1;
+	}
 
 	/* Initialize xcache and queues */
 	xcache_init(cached->cache, cached->cache_size,
 			&c_ops, XCACHE_LRU_HEAP | XCACHE_USE_RMTABLE, peer);
 	cached->cache_size = cached->cache->size; /* cache size may have changed if
-											     not power of 2 */
+						     not power of 2 */
 	if (cached->cache_size < peer->nr_ops){
 		XSEGLOG2(&lc, E, "Cache size should be at least nr_ops\n"
 				 "\tEffective cache size %u < nr_ops: %u",
@@ -1858,8 +2107,10 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	}
 
 	xworkq_init(&cached->workq, NULL, 0);
-	xwaitq_init(&cached->pending_waitq, cache_not_full, cached, 0);
+	waitq_init(&cached->pending_waitq, cache_not_full, cached, 0);
 
+	xseg_set_max_requests(peer->xseg, peer->portno_start, 10000);
+	xseg_set_freequeue_size(peer->xseg, peer->portno_start, 10000, 0);
 	print_cached(cached);
 	return 0;
 
