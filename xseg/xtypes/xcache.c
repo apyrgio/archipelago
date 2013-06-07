@@ -71,6 +71,7 @@ static xqindex __pop_lru(struct xcache *cache)
 	struct xcache_entry *ce;
 
 	lru = __get_idx(cache, cache->lru);
+	ce = &cache->nodes[lru];
 	if (ce == cache->mru && ce == cache->lru) {	/* Last in list */
 		cache->mru = NULL;
 		cache->lru = NULL;
