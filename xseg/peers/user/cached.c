@@ -75,12 +75,13 @@
  * this position
  */
 #define SET_FLAG(__ftype, __flag, __val)	\
-	__flag = (__flag & ~(__ftype##_BITMASK << __ftype##_FLAG_POS)) | \
-	(__val << __ftype##_FLAG_POS);
+	__flag = (__flag & ~((uint32_t)__ftype##_BITMASK << __ftype##_FLAG_POS)) | \
+	((uint32_t)__val << __ftype##_FLAG_POS);
 
 /* Apply bitmask to flags, shift result to the right to get correct value */
 #define GET_FLAG(__ftype, __flag)			\
-	(__flag & (__ftype##_BITMASK << __ftype##_FLAG_POS)) >> __ftype##_FLAG_POS
+	(__flag & ((uint64_t)__ftype##_BITMASK << __ftype##_FLAG_POS)) >> \
+	(uint32_t)__ftype##_FLAG_POS
 
 /* write policies */
 #define WRITETHROUGH 1
@@ -314,7 +315,7 @@ static int claim_bucket(struct ce *ce, uint32_t bucket_no)
 	}
 
 	__set_bucket_alloc_status(ce, b, CLAIMED);
-	b->data = idx * cached->bucket_size;
+	b->data = cached->bucket_data + (idx * cached->bucket_size);
 
 	return 0;
 }
@@ -820,15 +821,17 @@ void *init_node(void *c, void *xh)
 	xlock_release(&ce->lock);
 
 	ce->buckets = calloc(cached->buckets_per_object, sizeof(struct bucket));
- 	bac = ce->bucket_alloc_status_counters;
 	bac = calloc(BUCKET_ALLOC_STATUSES, sizeof(uint32_t));
- 	bdc = ce->bucket_data_status_counters;
-	bac = calloc(BUCKET_DATA_STATUSES, sizeof(uint32_t));
+ 	ce->bucket_alloc_status_counters = bac;
+	bdc = calloc(BUCKET_DATA_STATUSES, sizeof(uint32_t));
+ 	ce->bucket_data_status_counters = bdc;
 
 	ce->pr.priv = malloc(sizeof(struct cache_io));
 
-	if (!ce->buckets || !bac || !bdc || !ce->pr.priv)
+	if (!ce->buckets || !bac || !bdc || !ce->pr.priv) {
+		XSEGLOG2(&lc, E, "Node allocation failed");
 		goto ce_fields_fail;
+	}
 
 	ce->pr.peer = peer;
 	ce->pr.portno = peer->portno_start;
@@ -848,7 +851,6 @@ ce_fields_fail:
 	free(ce->pr.priv);
 	free(ce);
 ce_fail:
-	perror("malloc");
 	return NULL;
 }
 
@@ -1219,7 +1221,7 @@ static void handle_readwrite_claim(void *q, void *arg)
 	uint32_t start_bucket, end_bucket;
 	int r;
 
-	XSEGLOG2(&lc, D, "Started");
+	XSEGLOG2(&lc, D, "Started for %p (h: %lu, pr: %p)", ce, cio->h, pr);
 
 	/* TODO: Check here for error. We may not need to claim the buckets */
 
@@ -1227,8 +1229,8 @@ static void handle_readwrite_claim(void *q, void *arg)
 	start_bucket = __get_bucket(cached, req->offset);
 	end_bucket = __get_bucket(cached, req->offset + req->size - 1);
 
-	XSEGLOG2(&lc, D, "Trying to claim buckets [%u, %u] for target %s",
-			start_bucket, end_bucket, target);
+	XSEGLOG2(&lc, D, "Trying to claim buckets [%u, %u]",
+			start_bucket, end_bucket);
 
 	r = claim_bucket_range(ce, start_bucket, end_bucket);
 	/* FIXME: No this is wrong */
@@ -1974,6 +1976,7 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	char write_policy[MAX_ARG_LEN + 1];
 	long bportno = -1;
 	long cache_size = -1;
+	int r;
 
 	bucket_size[0] = 0;
 	object_size[0] = 0;
@@ -2086,10 +2089,15 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	/*** End of parsing ***/
 
 	/* Initialize xcache and queues */
-	xcache_init(cached->cache, cached->cache_size,
+	cached->buckets_per_object = cached->object_size / cached->bucket_size;
+	r = xcache_init(cached->cache, cached->cache_size,
 			&c_ops, XCACHE_LRU_O1 | XCACHE_USE_RMTABLE, peer);
-	cached->cache_size = cached->cache->size; /* cache size may have changed if
-						     not power of 2 */
+	if (r < 0) {
+		XSEGLOG2(&lc, E, "Could initialize cache");
+		goto arg_fail;
+	}
+	cached->cache_size = cached->cache->size; /* cache size may have changed
+						     if not power of 2 */
 	if (cached->cache_size < peer->nr_ops){
 		XSEGLOG2(&lc, E, "Cache size should be at least nr_ops\n"
 				 "\tEffective cache size %u < nr_ops: %u",
@@ -2098,7 +2106,6 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	}
 
 	/* Initialize buckets */
-	cached->buckets_per_object = cached->object_size / cached->bucket_size;
 	cached->bucket_data = malloc(cached->object_size * cached->cache_size);
 	if (!cached->bucket_data) {
 		XSEGLOG2(&lc, E, "Cannot allocate enough space for bucket data");
