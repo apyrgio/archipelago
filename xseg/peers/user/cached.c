@@ -55,15 +55,14 @@
  * Data status occupied 2nd-4th flag bit.
  */
 
-#define BUCKET_ALLOC_STATUSES 3
+#define BUCKET_ALLOC_STATUSES 2
 #define BUCKET_ALLOC_STATUS_FLAG_POS 0
-#define BUCKET_ALLOC_STATUS_BITMASK 2
-#define UNCLAIMED 0
-#define CLAIMING  1
-#define CLAIMED   2
+#define BUCKET_ALLOC_STATUS_BITMASK 1
+#define FREE 0
+#define CLAIMED   1
 
 #define BUCKET_DATA_STATUSES 5
-#define BUCKET_DATA_STATUS_FLAG_POS 2
+#define BUCKET_DATA_STATUS_FLAG_POS 1
 #define BUCKET_DATA_STATUS_BITMASK 3
 #define INVALID   0
 #define LOADING   1
@@ -87,14 +86,14 @@
 #define WRITETHROUGH 1
 #define WRITEBACK    2
 
-#define WRITE_POLICY(__wcp)								\
-	(__wcp == WRITETHROUGH	? "writethrough"	:		\
-	__wcp == WRITEBACK	? "writeback"			:		\
+#define WRITE_POLICY(__wcp)				\
+	(__wcp == WRITETHROUGH	? "writethrough" :	\
+	__wcp == WRITEBACK	? "writeback"	 :	\
 	"undefined")
 
 /* cio states */
 #define CIO_FAILED		1
-#define CIO_ACCEPTED	2
+#define CIO_ACCEPTED		2
 #define CIO_READING		3
 #define CIO_WRITING		4
 #define CIO_SERVED		5
@@ -104,7 +103,7 @@
 #define CE_WRITING		2
 #define CE_FLUSHING		3
 #define CE_DELETING		4
-#define CE_INVALIDATED	5
+#define CE_INVALIDATED		5
 #define CE_FAILED		6
 
 #define BUCKET_SIZE_QUANTUM 4096
@@ -306,15 +305,7 @@ static int claim_bucket(struct ce *ce, uint32_t bucket_no)
 	struct peerd *peer = ce->pr.peer;
 	struct cached *cached = __get_cached(peer);
 	struct bucket *b = &ce->buckets[bucket_no];
-	int status;
 	xqindex idx;
-
-	status = __get_bucket_alloc_status(b);
-	if (status != UNCLAIMED) {
-		XSEGLOG2(&lc, E, "BUG: Bucket %u of ce %p has state %d",
-				bucket_no, ce, status);
-		return status;
-	}
 
 	idx = xq_pop_head(&cached->bucket_idx, 1);
 	if (idx == Noneidx) {
@@ -331,16 +322,28 @@ static int claim_bucket(struct ce *ce, uint32_t bucket_no)
 static int claim_bucket_range(struct ce *ce,
 		uint32_t start_bucket, uint32_t end_bucket)
 {
+	struct bucket *b;
 	uint32_t i;
+	int status;
 	int r = 0;
 
-	for (i = start_bucket; i <= end_bucket && r == 0; i++)
+	for (i = start_bucket; i <= end_bucket; i++) {
+		b = &ce->buckets[i];
+		status = __get_bucket_alloc_status(b);
+
+		if (status == CLAIMED)
+			continue;
+
 		r = claim_bucket(ce, i);
+		if (r < 0) {
+			/* FIXME: Enqueue work */
+			XSEGLOG2(&lc, E, "Could not claim bucket %u for ce %p",
+					i, ce);
+			return r;
+		}
+	}
+
 	return 0;
-#if 0
-	if (r != 0)
-		/* return error and bucket simultaneously */
-#endif
 }
 
 static void rw_bucket(struct bucket *b, int op, unsigned char *data,
@@ -364,7 +367,6 @@ static void rw_bucket_range(struct ce *ce, int op, unsigned char *data,
 	struct peerd *peer = ce->pr.peer;
 	struct cached *cached = __get_cached(peer);
 	struct bucket *b;
-	unsigned char *bucket_data;
 	uint32_t start_bucket, end_bucket;
 	uint64_t bucket_offset, data_size;
 	uint32_t i;
@@ -398,14 +400,7 @@ static int cache_not_full(void *arg)
 	return xcache_free_nodes(cached->cache) > 0;
 }
 
-static int all_buckets_claimed(void *arg)
-{
-	struct ce *ce = (struct ce *)arg;
-	uint32_t *bac = ce->bucket_alloc_status_counters;
-
-	return bac[CLAIMING] == 0;
-}
-
+__attribute__ ((unused))
 static void __print_bc(uint32_t *bc) {
 	XSEGLOG("Bucket statuses:\n"
 			"Loading %u,\n"
@@ -889,9 +884,9 @@ int on_init(void *c, void *e)
 		bdc[i] = 0;
 	for (i = 0; i < cached->buckets_per_object; i++) {
 		SET_FLAG(BUCKET_ALLOC_STATUS, ce->buckets[i].flags, INVALID);
-		SET_FLAG(BUCKET_DATA_STATUS, ce->buckets[i].flags, UNCLAIMED);
+		SET_FLAG(BUCKET_DATA_STATUS, ce->buckets[i].flags, FREE);
 	}
-	bac[UNCLAIMED] = cached->buckets_per_object;
+	bac[FREE] = cached->buckets_per_object;
 	bdc[INVALID] = cached->buckets_per_object;
 
 	return 0;
@@ -1028,23 +1023,6 @@ static void handle_read(void *q, void *arg)
 	}
 	XSEGLOG2(&lc, D, "Start: %lu, end %lu for ce: %p", start_bucket, end_bucket);
 
-	/*
-	 * BTODO:
-	 * If bucket status is UNCLAIMED, claim bucket
-	 * If bucket status is CLAIMING, wait on bucket waitq
-	 * If bucket status is CLAIMED, carry on
-	 */
-	for (i = start_bucket; i <= end_bucket; i++) {
-		b = &ce->buckets[i];
-		status = __get_bucket_alloc_status(b);
-
-		if (status == UNCLAIMED) {
-			claim_bucket(ce, i);
-		} else if (status == CLAIMING) {
-			XSEGLOG2(&lc, E, "Bucket %u is being claimed", i);
-		}
-	}
-
 	/* Issue read requests to blocker for invalid buckets */
 	for (i = start_bucket; i <= end_bucket; i++) {
 		b = &ce->buckets[i];
@@ -1145,10 +1123,10 @@ static void handle_write(void *q, void *arg)
 	struct bucket *b;
 
 	unsigned char *req_data = (unsigned char *)xseg_get_data(peer->xseg, req);
-	uint32_t i, start_bucket, end_bucket, last_read_bucket = -1;
+	uint32_t start_bucket, end_bucket, last_read_bucket = -1;
 	uint64_t first_bucket_offset = req->offset % cached->bucket_size;
 	uint64_t last_bucket_offset = (req->offset + req->size) % cached->bucket_size;
-	int status, start_bucket_status, end_bucket_status;
+	int start_bucket_status, end_bucket_status;
 
 	XSEGLOG2(&lc, D, "Started for %p (h: %lu, pr: %p)", ce, cio->h, pr);
 	//what about FUA?
@@ -1159,24 +1137,6 @@ static void handle_write(void *q, void *arg)
 
 	start_bucket = __get_bucket(cached, req->offset);
 	end_bucket = __get_bucket(cached, req->offset + req->size - 1);
-
-	/*
-	 * BTODO:
-	 * If bucket status is UNCLAIMED, claim bucket
-	 * If bucket status is CLAIMING, wait on bucket waitq
-	 * If bucket status is CLAIMED, carry on
-	 */
-	for (i = start_bucket; i <= end_bucket; i++) {
-		b = &ce->buckets[i];
-		status = __get_bucket_alloc_status(b);
-
-		if (status == UNCLAIMED) {
-			claim_bucket(ce, i);
-		} else if (status == CLAIMING) {
-			XSEGLOG2(&lc, E, "Bucket %u is being claimed", i);
-		}
-	}
-
 
 	/*
 	 * In case of a misaligned write, if the start, end buckets of the write
@@ -1245,6 +1205,52 @@ out:
 	}
 
 	XSEGLOG2(&lc, D, "Finished for %p (h: %lu, pr: %p)", ce, cio->h, pr);
+}
+
+static void handle_readwrite_claim(void *q, void *arg)
+{
+	struct peer_req *pr = (struct peer_req *)arg;
+	struct peerd *peer = pr->peer;
+	struct cached *cached = __get_cached(peer);
+	struct cache_io *cio = __get_cache_io(pr);
+	struct ce *ce = (struct ce *)xcache_get_entry(cached->cache, cio->h);
+	struct xseg_request *req = pr->req;
+	char *target = xseg_get_target(peer->xseg, req);
+	uint32_t start_bucket, end_bucket;
+	int r;
+
+	XSEGLOG2(&lc, D, "Started");
+
+	/* TODO: Check here for error. We may not need to claim the buckets */
+
+	/* Get request bucket limits */
+	start_bucket = __get_bucket(cached, req->offset);
+	end_bucket = __get_bucket(cached, req->offset + req->size - 1);
+
+	XSEGLOG2(&lc, D, "Trying to claim buckets [%u, %u] for target %s",
+			start_bucket, end_bucket, target);
+
+	r = claim_bucket_range(ce, start_bucket, end_bucket);
+	/* FIXME: No this is wrong */
+	if (r < 0)
+		goto fail;
+
+	switch (req->op) {
+		case X_WRITE:
+			handle_write(q, arg);
+			goto out;
+		case X_READ:
+			handle_read(q, arg);
+			goto out;
+		default:
+			XSEGLOG2(&lc, E, "Invalid op %u", req->op);
+	}
+
+fail:
+	XSEGLOG2(&lc, E, "Failing pr %p", pr);
+	cached_fail(peer, pr);
+out:
+	XSEGLOG2(&lc, D, "Finished");
 }
 
 /*
@@ -1340,19 +1346,7 @@ static void handle_readwrite(void *q, void *arg)
 
 	XSEGLOG2(&lc, I, "Target %s is in cache (h: %lu)", name, h);
 
-	/* FIXME: What will our coding style be for switches? */
-	switch (req->op) {
-	case X_WRITE:
-		r = xworkq_enqueue(&ce->workq, handle_write, (void *)pr);
-		break;
-	case X_READ:
-		r = xworkq_enqueue(&ce->workq, handle_read, (void *)pr);
-		break;
-	default:
-		r = -1;
-		XSEGLOG2(&lc, E, "Invalid op %u", req->op);
-	}
-
+	r = xworkq_enqueue(&ce->workq, handle_readwrite_claim, (void *)pr);
 	if (r >= 0)
 		xworkq_signal(&ce->workq);
 
@@ -2093,7 +2087,7 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 
 	/* Initialize xcache and queues */
 	xcache_init(cached->cache, cached->cache_size,
-			&c_ops, XCACHE_LRU_HEAP | XCACHE_USE_RMTABLE, peer);
+			&c_ops, XCACHE_LRU_O1 | XCACHE_USE_RMTABLE, peer);
 	cached->cache_size = cached->cache->size; /* cache size may have changed if
 						     not power of 2 */
 	if (cached->cache_size < peer->nr_ops){
