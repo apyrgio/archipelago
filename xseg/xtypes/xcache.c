@@ -70,19 +70,24 @@ static xqindex __pop_lru(struct xcache *cache)
 	xqindex lru;
 	struct xcache_entry *ce;
 
+	/* Get LRU from cache */
 	lru = __get_idx(cache, cache->lru);
-	ce = &cache->nodes[lru];
-	if (ce == cache->mru && ce == cache->lru) {	/* Last in list */
+	ce = cache->lru;
+
+	/* Special care is needed for the last item */
+	if (!ce->younger && !ce->older) {
+		if (cache->mru != cache->lru)
+			XSEGLOG("BUG: LRU corruption for last item");
 		cache->mru = NULL;
 		cache->lru = NULL;
 		ce->younger = NULL;
 		ce->older = NULL;
 		return lru;
 	}
-	cache->lru = cache->lru->younger;
+	/* For all other items, make LRU the second oldest item */
+	cache->lru = ce->younger;
 	cache->lru->older = NULL;
 
-	ce = &cache->nodes[lru];
 	ce->younger = NULL;
 	ce->older = NULL;
 
@@ -93,26 +98,36 @@ static void __append_mru(struct xcache *cache, struct xcache_entry *ce)
 {
 	/* Initialize LRU if we are the first */
 	if (cache->lru == NULL) {
+		if (cache->mru != NULL)
+			XSEGLOG("BUG: LRU corruption 1");
 		cache->mru = ce;
 		cache->lru = ce;
 		return;
 	}
 
-	if (ce->younger == NULL && ce->younger == NULL) {
+	/* The MRU element obviously needs no update */
+	if (ce == cache->mru) {
+		return;
+	}
+
+	/* New elements have no neighbors and can go straight to the top */
+	if (ce->younger == NULL && ce->older == NULL) {
+		if (ce == cache->lru)
+			XSEGLOG("BUG: LRU corruption 2");
 		ce->older = cache->mru;
 		cache->mru->younger = ce;
 		cache->mru = ce;
 		return;
 	}
 
-	if (ce == cache->mru) { /* No need to update in this case */
-		return;
-	}
-
-	if (ce == cache->lru)	/* There is no ce->older */
+	/* The LRU element needs special care since there is no ce->older */
+	if (ce == cache->lru) {
+		if (ce->younger == NULL)
+			XSEGLOG("BUG: LRU corruption 3");
 		cache->lru = ce->younger;
-	else
+	} else {
 		ce->older->younger = ce->younger;
+	}
 	ce->younger->older = ce->older;
 
 	/* Put ce on top (MRU) */
@@ -125,20 +140,19 @@ static void __append_mru(struct xcache *cache, struct xcache_entry *ce)
 static void __remove_from_list(struct xcache *cache, struct xcache_entry *ce)
 {
 	/* Check if entry has already been removed */
-	if (ce->younger == NULL && ce->older == NULL)
+	if (!ce->younger && !ce->older && ce != cache->lru)
 		return;
 
-	if (ce == cache->mru && ce == cache->lru) {	/* Last in list */
+	/* Check if this entry is the last in queue */
+	if (!ce->younger && !ce->older) {
 		cache->mru = NULL;
 		cache->lru = NULL;
-		ce->younger = NULL;
-		ce->older = NULL;
 	} else if (ce == cache->mru) {
 		cache->mru = ce->older;
-		ce->older->younger = NULL;
+		cache->mru->younger = NULL;
 	} else if (ce == cache->lru) {
 		cache->lru = ce->younger;
-		ce->younger->older = NULL;
+		cache->lru->older = NULL;
 	} else {
 		ce->younger->older = ce->older;
 		ce->older->younger = ce->younger;
