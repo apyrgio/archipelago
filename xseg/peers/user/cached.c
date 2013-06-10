@@ -530,13 +530,13 @@ static int serve_req(struct peerd *peer, struct peer_req *pr)
 	struct xseg_request *req = pr->req;
 	unsigned char *req_data = (unsigned char *)xseg_get_data(xseg, req);
 
-	XSEGLOG2(&lc, D, "Started\n");
+	XSEGLOG2(&lc, D, "Started");
 	req->serviced = req->size;
 
 	//assert req->serviced <= req->datalen
 	//memcpy(req_data, ce->data + req->offset, req->serviced);
 	rw_bucket_range(ce, X_READ, req_data, req->offset, req->size);
-	XSEGLOG2(&lc, D, "Finished\n");
+	XSEGLOG2(&lc, D, "Finished");
 
 	return 0;
 }
