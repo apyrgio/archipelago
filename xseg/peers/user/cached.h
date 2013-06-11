@@ -124,6 +124,7 @@ struct cached {
 	struct xworkq workq;
 	struct xwaitq pending_waitq;
 	struct xwaitq bucket_waitq;
+	struct xwaitq req_waitq;
 	unsigned char *bucket_data;
 	struct xq bucket_indexes;
 	//scheduler
