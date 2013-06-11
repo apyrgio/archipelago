@@ -541,6 +541,9 @@ static int generic_peerd_loop(void *arg)
 	XSEGLOG2(&lc, I, "%s has tid %u.\n", id, pid);
 	xseg_init_local_signal(xseg, peer->portno_start);
 	//for (;!(isTerminate() && xq_count(&peer->free_reqs) == peer->nr_ops);) {
+#ifdef GPERF
+	ProfilerStart("/tmp/profile-cached1.prof");
+#endif
 	for (;!(isTerminate() && all_peer_reqs_free(peer));) {
 		//Heart of peerd_loop. This loop is common for everyone.
 		for(loops = threshold; loops > 0; loops--) {
@@ -564,6 +567,9 @@ static int generic_peerd_loop(void *arg)
 		xseg_cancel_wait(xseg, peer->portno_start);
 		XSEGLOG2(&lc, I, "%s woke up\n", id);
 	}
+#ifdef GPERF
+	ProfilerStop();
+#endif
 	return 0;
 }
 

@@ -87,7 +87,8 @@ archip-bench: $(BENCH_PREQ)
 	$(CC) $(CFLAGS) -o $@ $(CPREQS) $(INC) -L$(LIB) -lxseg -lpthread -lm
 
 archip-cached: cached.c cached.h peer.c peer.h
-	$(CC) $(CFLAGS) -o $@ $< peer.c $(INC) -L$(LIB) -lxseg -lpthread -DMT
+	$(CC) $(CFLAGS) -o $@ $< peer.c $(INC) -L$(LIB) -lxseg -lpthread -DMT \
+		-lprofiler -DGPERF
 
 archip-filed: filed.c peer.c peer.h hash.c hash.h $(BASE)/xseg/protocol.h
 	$(CC) $(CFLAGS) -o $@ $(CPREQS) $(INC) -L$(LIB) -lxseg -lpthread -DMT \
