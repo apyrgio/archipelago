@@ -866,6 +866,7 @@ void *init_node(void *c, void *xh)
 	struct ce *ce;
 	uint32_t *bac;
 	uint32_t *bdc;
+	int i;
 
 	ce = malloc(sizeof(struct ce));
 	if (!ce)
@@ -886,6 +887,12 @@ void *init_node(void *c, void *xh)
 		XSEGLOG2(&lc, E, "Node allocation failed");
 		goto ce_fields_fail;
 	}
+	for (i = 0; i < cached->buckets_per_object; i++) {
+		SET_FLAG(BUCKET_ALLOC_STATUS, ce->buckets[i].flags, INVALID);
+		SET_FLAG(BUCKET_DATA_STATUS, ce->buckets[i].flags, FREE);
+	}
+	bac[FREE] = cached->buckets_per_object;
+	bdc[INVALID] = cached->buckets_per_object;
 
 	ce->pr.peer = peer;
 	ce->pr.portno = peer->portno_start;
@@ -895,7 +902,6 @@ void *init_node(void *c, void *xh)
 
 	xworkq_init(&ce->workq, &ce->lock, 0);
 	xworkq_init(&ce->deferred_workq, &ce->lock, 0);
-	//waitq_init(&ce->bucket_waitq, all_buckets_claimed, ce, 0)
 	return ce;
 
 ce_fields_fail:
@@ -941,12 +947,6 @@ int on_init(void *c, void *e)
 		bac[i] = 0;
 	for (i = 0; i < BUCKET_DATA_STATUSES; i++)
 		bdc[i] = 0;
-#if 0
-	for (i = 0; i < cached->buckets_per_object; i++) {
-		SET_FLAG(BUCKET_ALLOC_STATUS, ce->buckets[i].flags, INVALID);
-		SET_FLAG(BUCKET_DATA_STATUS, ce->buckets[i].flags, FREE);
-	}
-#endif
 	bac[FREE] = cached->buckets_per_object;
 	bdc[INVALID] = cached->buckets_per_object;
 
