@@ -871,7 +871,7 @@ void *init_node(void *c, void *xh)
 	if (!ce)
 		goto ce_fail;
 
-	memset(ce, 0, sizeof(struct ce)); /* Clear the struct from junk values yy*/
+	memset(ce, 0, sizeof(struct ce)); /* Clear the struct from junk values */
 	xlock_release(&ce->lock);
 
 	ce->buckets = calloc(cached->buckets_per_object, sizeof(struct bucket));
@@ -934,14 +934,19 @@ int on_init(void *c, void *e)
 	 * We don't use __set_bucket_*_status_range here, since previous bucket
 	 * statuses will affect our counters
 	 */
+	if (bac[CLAIMED] > 0 || bac[FREE] != cached->buckets_per_object)
+		XSEGLOG2(&lc, W, "BUG: Wrong values for new entry %p", e);
+
 	for (i = 0; i < BUCKET_ALLOC_STATUSES; i++)
 		bac[i] = 0;
 	for (i = 0; i < BUCKET_DATA_STATUSES; i++)
 		bdc[i] = 0;
+#if 0
 	for (i = 0; i < cached->buckets_per_object; i++) {
 		SET_FLAG(BUCKET_ALLOC_STATUS, ce->buckets[i].flags, INVALID);
 		SET_FLAG(BUCKET_DATA_STATUS, ce->buckets[i].flags, FREE);
 	}
+#endif
 	bac[FREE] = cached->buckets_per_object;
 	bdc[INVALID] = cached->buckets_per_object;
 
@@ -1204,6 +1209,8 @@ static void handle_write(void *q, void *arg)
 	b = &ce->buckets[start_bucket];
 	start_bucket_status = __get_bucket_data_status(b);
 	if (start_bucket_status == INVALID && first_bucket_offset) {
+		XSEGLOG2(&lc, W, "Misalligned write for %p (h: %lu, pr: %p)",
+				ce, cio->h, pr);
 		if (rw_range(peer, pr, X_READ, start_bucket, start_bucket) < 0) {
 			cio->state = CIO_FAILED;
 			goto out;
@@ -1217,6 +1224,8 @@ static void handle_write(void *q, void *arg)
 	b = &ce->buckets[end_bucket];
 	end_bucket_status = __get_bucket_data_status(b);
 	if (end_bucket_status == INVALID && last_bucket_offset) {
+		XSEGLOG2(&lc, W, "Misalligned write for %p (h: %lu, pr: %p)",
+				ce, cio->h, pr);
 		if (rw_range(peer, pr, X_READ, end_bucket, end_bucket) < 0) {
 			cio->state = CIO_FAILED;
 			goto out;
@@ -2234,6 +2243,8 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 		XSEGLOG2(&lc, E, "Cannot allocate enough space for bucket data");
 		goto cio_fail;
 	}
+	/* Touch the malloced space to be fast even for cold cache */
+	memset(cached->bucket_data, 0, cached->total_size);
 
 	total_buckets = cached->total_size / cached->bucket_size;
 
