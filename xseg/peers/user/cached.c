@@ -381,6 +381,24 @@ static inline uint64_t __count_free_buckets(struct cached *cached)
 	return (uint64_t)xq_count(&cached->bucket_indexes);
 }
 
+static inline uint64_t __count_free_reqs(struct xseg_port *p, struct xseg *xseg)
+{
+	struct xq *q;
+	uint64_t count = 0;
+
+	q = XPTR_TAKE(p->free_queue, xseg->segment);
+	count += (uint64_t)xq_count(q);
+	count += p->max_alloc_reqs - p->alloc_reqs;
+
+	return count;
+}
+
+static inline uint64_t __count_queue_size(struct xq *q)
+{
+	return (uint64_t)xq_count(q);
+}
+
+
 static int bucket_pool_not_empty(void *arg)
 {
 	struct cached *cached = (struct cached *)arg;
@@ -391,6 +409,16 @@ static int cache_not_full(void *arg)
 {
 	struct cached *cached = (struct cached *)arg;
 	return xcache_free_nodes(cached->cache) > 0;
+}
+
+static int req_pool_not_empty(void *arg)
+{
+	struct peerd *peer = (struct peerd *)arg;
+	struct xseg *xseg = peer->xseg;
+	xport portno = peer->portno_start;
+	struct xseg_port *port = xseg_get_port(xseg, portno);
+
+	return __count_free_reqs(port, xseg) > 0;
 }
 
 __attribute__ ((unused))
@@ -516,6 +544,21 @@ static void signal_workq(void *q, void *arg)
 {
 	struct xworkq *workq = (struct xworkq *)arg;
 	xworkq_signal(workq);
+}
+
+
+static void put_ce(void *q, void *arg)
+{
+	struct peer_req *pr = (struct peer_req *)arg;
+	struct peerd *peer = pr->peer;
+	struct cached *cached = __get_cached(peer);
+	struct cache_io *cio = __get_cache_io(pr);
+	xcache_handler h = cio->h;
+
+	if (__is_handler_valid(h))
+		xcache_put(cached->cache, h);
+	else
+		XSEGLOG2(&lc, W, "Invalid handler for cio %p", cio);
 }
 
 /*
@@ -698,7 +741,7 @@ static void flush_dirty_buckets(struct cached *cached, struct peer_req *pr)
 	uint32_t i, first_dirty, last_dirty;
 
 	/* write all dirty buckets */
-	for (i = 0; i <= end && cio->pending_reqs < 13; i++) {
+	for (i = 0; i <= end; i++) {
 		b = &ce->buckets[i];
 		if (__get_bucket_data_status(b) != DIRTY)
 			continue;
@@ -711,8 +754,23 @@ static void flush_dirty_buckets(struct cached *cached, struct peer_req *pr)
 				ce, first_dirty, last_dirty);
 
 		if (rw_range(peer, pr, X_WRITE, first_dirty, last_dirty) < 0){
-			XSEGLOG2(&lc, E, "Flush of entry %p failed (h: %lu)", ce, cio->h);
-			cio->state = CIO_FAILED;
+			XSEGLOG2(&lc, W, "Flush of entry %p failed (h: %lu).\n"
+					"\tOut of requests.", ce, cio->h);
+			/*
+			 * Since there is a request sent, we can postpone
+			 * sending the rest. We will be notified when this one
+			 * returns.
+			 */
+			if (cio->pending_reqs > 0) {
+				XSEGLOG2(&lc, I, "Requests have already been "
+						"sent though");
+				return;
+			}
+			cio->work.job_fn = put_ce;
+			cio->work.job = (void *)pr;
+			ce->status = CE_READY;
+			xwaitq_enqueue(&cached->req_waitq, &cio->work);
+			return;
 		}
 		__set_bucket_data_status_range(ce, first_dirty, last_dirty, WRITING);
 		cio->pending_reqs++;
@@ -790,10 +848,6 @@ out:
 	} else if (cio->pending_reqs) {
 		XSEGLOG2(&lc, D, "Sent %lu flush request(s) to blocker",
 				cio->pending_reqs);
-	} else {
-		XSEGLOG2(&lc, W, "BUG: Entry (ce :%p) was(?) dirty but flush was not "
-				"necessary", ce);
-		cached_complete(peer, pr);
 	}
 }
 
@@ -1599,6 +1653,9 @@ static void complete_write_back(struct peerd *peer, struct peer_req *pr,
 
 out:
 	xseg_put_request(peer->xseg, req, pr->portno);
+	if (__count_queue_size(cached->req_waitq.q) > 0) {
+		xworkq_enqueue(&cached->workq, signal_waitq, &cached->req_waitq);
+	}
 
 	if (cio->pending_reqs){
 		XSEGLOG2(&lc, D, "%lu request(s) remaining for pr %p (ce: %p, h: %lu)",
@@ -2178,9 +2235,10 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	xworkq_init(&cached->workq, NULL, 0);
 	xwaitq_init(&cached->pending_waitq, cache_not_full, cached, 0);
 	xwaitq_init(&cached->bucket_waitq, bucket_pool_not_empty, cached, 0);
+	xwaitq_init(&cached->req_waitq, req_pool_not_empty, peer, 0);
 
-	//xseg_set_max_requests(peer->xseg, peer->portno_start, 10000);
-	//xseg_set_freequeue_size(peer->xseg, peer->portno_start, 10000, 0);
+	xseg_set_max_requests(peer->xseg, peer->portno_start, 10000);
+	xseg_set_freequeue_size(peer->xseg, peer->portno_start, 10000, 0);
 	print_cached(cached);
 	return 0;
 
