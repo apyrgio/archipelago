@@ -252,23 +252,18 @@ static uint32_t __get_last_dirty(struct ce *ce, uint32_t start, uint32_t limit)
  * type.
  */
 
-static int claim_bucket(struct ce *ce, uint32_t bucket_no)
+static int __claim_bucket(struct ce *ce, struct bucket *b)
 {
 	struct peerd *peer = ce->pr.peer;
 	struct cached *cached = __get_cached(peer);
-	struct bucket *b = &ce->buckets[bucket_no];
 	xqindex index;
 
-	index = xq_pop_head(&cached->bucket_indexes, 1);
-	if (index == Noneidx) {
-		XSEGLOG2(&lc, D, "Could not claim bucket");
+	index = __xq_pop_head(&cached->bucket_indexes);
+	if (index == Noneidx)
 		return -1;
-	}
 
-	__set_bucket_alloc_status(ce, b, CLAIMED);
 	b->data = cached->bucket_data + (index * cached->bucket_size);
-	XSEGLOG2(&lc, D, "Bucket %u is at address %p (ce: %p)",
-			bucket_no, b->data, ce);
+	__set_bucket_alloc_status(ce, b, CLAIMED);
 
 	return 0;
 }
@@ -280,74 +275,93 @@ static int claim_bucket(struct ce *ce, uint32_t bucket_no)
 static int claim_bucket_range(struct ce *ce,
 		uint32_t start_bucket, uint32_t end_bucket)
 {
+	struct peerd *peer = ce->pr.peer;
+	struct cached *cached = __get_cached(peer);
 	struct bucket *b;
-	uint32_t i;
-	int status;
+	struct xq *bq = &cached->bucket_indexes;
+	int alloc_status;
 	int r = 0;
+	uint32_t i;
 
+	/* Acquire lock for bucket pool */
+	xlock_acquire(&bq->lock, 4);
 	for (i = start_bucket; i <= end_bucket; i++) {
 		b = &ce->buckets[i];
-		status = __get_bucket_alloc_status(b);
+		alloc_status = __get_bucket_alloc_status(b);
 
-		if (status == CLAIMED)
+		if (alloc_status == CLAIMED)
 			continue;
 
-		r = claim_bucket(ce, i);
+		r = __claim_bucket(ce, b);
 		if (r < 0)
-			return r;
+			goto out;
 	}
 
-	return 0;
+out:
+	xlock_release(&bq->lock);
+	return r;
 }
 
-static void free_bucket(struct ce *ce, struct bucket *b)
+static int __free_bucket(struct ce *ce, struct bucket *b)
 {
 	struct peerd *peer = ce->pr.peer;
 	struct cached *cached = __get_cached(peer);
 	xqindex index;
+	xserial serial;
 
 	index = (b->data - cached->bucket_data) / cached->bucket_size;
+	serial = __xq_append_head(&cached->bucket_indexes, index);
+	if (UNLIKELY(serial == Noneidx))
+		XSEGLOG("BUG: Could not free bucket index. Queue is full");
 
 	__set_bucket_alloc_status(ce, b, FREE);
 	__set_bucket_data_status(ce, b, INVALID);
-	if (UNLIKELY(xq_append_head(&cached->bucket_indexes, index, 1) == Noneidx))
-		XSEGLOG("BUG: Could not free bucket index. Queue is full");
+
+	return 0;
 }
 
 /*
  * free_bucket_range() frees all claimed buckets within range and issues a
  * signal, if necessary.
  */
-static void free_bucket_range(struct ce *ce,
+static uint32_t free_bucket_range(struct ce *ce,
 		uint32_t start_bucket, uint32_t end_bucket)
 {
 	struct peerd *peer = ce->pr.peer;
 	struct cached *cached = __get_cached(peer);
 	struct bucket *b;
-	struct xwaitq *bwaitq = &cached->bucket_waitq;
+	struct xq *bq = &cached->bucket_indexes;
+	uint32_t *bac = ce->bucket_alloc_status_counters;
 	uint32_t i;
+	uint32_t freed = 0;
 	int alloc_status, data_status;
 
-	XSEGLOG2(&lc, D, "Started for ce %p", ce);
+	XSEGLOG2(&lc, D, "Started for ce %p [%u, %u]",
+			ce, start_bucket, end_bucket);
 
-	for (i = start_bucket; i <= end_bucket; i++) {
+	/* Acquire lock for bucket pool */
+	xlock_acquire(&bq->lock, 4);
+	for (i = start_bucket; i <= end_bucket && bac[CLAIMED]; i++) {
 		b = &ce->buckets[i];
 		alloc_status = __get_bucket_alloc_status(b);
-		data_status = __get_bucket_data_status(b);
 
-		if (alloc_status == FREE) {
-			XSEGLOG2(&lc, E, "BUG: Free bucket withing range");
+		if (alloc_status == FREE)
+			continue;
+
+		data_status = __get_bucket_data_status(b);
+		/* Safe to free buckets are only valid/invalid buckets */
+		if (UNLIKELY(data_status != VALID && data_status != INVALID)) {
+			XSEGLOG2(&lc, E, "BUG: Unsafe bucket within range");
 			continue;
 		}
-		/* Safe to free buckets are only valid/invalid buckets */
-		if (data_status == VALID || data_status == INVALID) {
-			free_bucket(ce, b);
-		}
-	}
 
-	/* Enqueue a signal if there are any waiters in the bucket waitq */
-	if (waiters_exist(bwaitq->q))
-		xworkq_enqueue(&cached->workq, signal_waitq, bwaitq);
+		/* TODO: Check if bucket has been returned to the pool */
+		__free_bucket(ce, b);
+		freed++;
+	}
+	xlock_release(&bq->lock);
+
+	return freed;
 }
 
 static void rw_bucket(struct bucket *b, int op, unsigned char *data,
@@ -470,7 +484,27 @@ static int __is_entry_clean(struct cached *cached, struct ce *ce)
 
 	if (ce->status == CE_FLUSHING || ce->status == CE_DELETING)
 		XSEGLOG2(&lc, I, "ce %p has pending work to do (status: %lu, "
-				"pending_reqs: %u)", ce, ce->status, ce_cio->pending_reqs);
+				"pending_reqs: %u)",
+				ce, ce->status, ce_cio->pending_reqs);
+
+	return 0;
+}
+
+static int __are_buckets_clean(struct ce *ce)
+{
+	struct peerd *peer = ce->pr.peer;
+	struct cached *cached = __get_cached(peer);
+	uint32_t *bac = ce->bucket_alloc_status_counters;
+	uint32_t *bdc = ce->bucket_data_status_counters;
+
+	if (bac[FREE] != cached->buckets_per_object ||
+			bdc[INVALID] != cached->buckets_per_object) {
+		XSEGLOG2(&lc, W, "Entry %p, has:\n"
+				"\t%u free buckets\n"
+				"\t%u invalid buckets\n",
+				ce, bac[FREE], bdc[INVALID]);
+		return -1;
+	}
 
 	return 0;
 }
@@ -497,14 +531,16 @@ static void print_cached(struct cached *cached)
 
 	XSEGLOG2(&lc, I, "Struct cached fields:\n"
 			"                     cache        = %p\n"
-			"                     max_objects   = %lu\n"
+			"                     max_objects  = %lu\n"
+			"                     total_size   = %lu\n"
 			"                     max_req_size = %lu\n"
-			"                     object_size  = %lu\n"
-			"                     bucket_size  = %lu\n"
-			"                     bucks_per_obj= %lu\n"
+			"                     object_size  = %u\n"
+			"                     bucket_size  = %u\n"
+			"                     bucks_per_obj= %u\n"
 			"                     Bportno      = %d\n"
 			"                     write_policy = %s\n",
-			cached->cache, cached->max_objects, cached->max_req_size,
+			cached->cache, cached->max_objects,
+			cached->total_size, cached->max_req_size,
 			cached->object_size, cached->bucket_size,
 			cached->buckets_per_object, cached->bportno,
 			WRITE_POLICY(cached->write_policy));
@@ -743,14 +779,22 @@ static void flush_dirty_buckets(struct cached *cached, struct peer_req *pr)
 	struct cache_io *cio = pr->priv;
 	struct ce *ce = xcache_get_entry(cached->cache, cio->h);
 	struct bucket *b;
+	uint32_t *bdc = ce->bucket_data_status_counters;
 	uint32_t end = cached->buckets_per_object - 1;
 	uint32_t i, first_dirty, last_dirty;
+	int data_status, alloc_status;
 
 	/* write all dirty buckets */
-	for (i = 0; i <= end; i++) {
+	for (i = 0; i <= end && bdc[DIRTY]; i++) {
 		b = &ce->buckets[i];
-		if (__get_bucket_data_status(b) != DIRTY)
+		data_status = __get_bucket_data_status(b);
+		alloc_status = __get_bucket_alloc_status(b);
+
+		if (alloc_status == FREE) {
 			continue;
+		} else if (data_status != DIRTY) {
+			continue;
+		}
 
 		first_dirty = i;
 		last_dirty = __get_last_dirty(ce, first_dirty, end);
@@ -936,13 +980,12 @@ int on_init(void *c, void *e)
 	ce_cio->state = CIO_ACCEPTED;
 	ce_cio->pending_reqs = 0;
 
+	//__are_buckets_clean(ce);
+
 	/*
 	 * We don't use __set_bucket_*_status_range here, since previous bucket
 	 * statuses will affect our counters
 	 */
-	if (bac[CLAIMED] > 0 || bac[FREE] != cached->buckets_per_object)
-		XSEGLOG2(&lc, W, "BUG: Wrong values for new entry %p", e);
-
 	for (i = 0; i < BUCKET_ALLOC_STATUSES; i++)
 		bac[i] = 0;
 	for (i = 0; i < BUCKET_DATA_STATUSES; i++)
@@ -996,6 +1039,28 @@ fail:
 
 }
 
+void on_put(void *c, void *e)
+{
+	struct peerd *peer = (struct peerd *)c;
+	struct cached *cached = peer->priv;
+	struct ce *ce = (struct ce *)e;
+	struct cache_io *ce_cio = ce->pr.priv;
+	struct xwaitq *bwaitq = &cached->bucket_waitq;
+	uint32_t r;
+
+	XSEGLOG2(&lc, I, "Puting cache entry %p (ce_cio: %p, h: %lu)",
+			ce, ce_cio, ce_cio->h);
+
+	r = free_bucket_range(ce, 0, cached->buckets_per_object - 1);
+
+	/* This function is here simply to alert us if buckets are not clean */
+	//__are_buckets_clean(ce);
+
+	/* Enqueue a signal if there are any waiters in the bucket waitq */
+	if (r && waiters_exist(bwaitq->q))
+		xworkq_enqueue(&cached->workq, signal_waitq, bwaitq);
+}
+
 /*
  * on free is called when the entry is guaranteed to be clean and cannot be
  * found through any hash table.
@@ -1011,6 +1076,7 @@ void on_free(void *c, void *e)
 
 	XSEGLOG2(&lc, I, "Freeing cache entry %p (ce_cio: %p, h: %lu)",
 			ce, ce_cio, ce_cio->h);
+
 	/*
 	 * Doesn't matter if signal can't be enqueued, pending_waitq will be
 	 * signalled eventually.
@@ -1024,7 +1090,7 @@ struct xcache_ops c_ops = {
 	.on_evict = on_evict,
 	.on_finalize = on_finalize,
 	.on_reinsert = on_reinsert,
-	.on_put = NULL,
+	.on_put = on_put,
 	.on_free  = on_free,
 	.on_node_init = init_node
 };
@@ -1335,6 +1401,8 @@ static void handle_readwrite_claim(void *q, void *arg)
 	/* Try to claim the necessary buckets */
 	r = claim_bucket_range(ce, start_bucket, end_bucket);
 	if (r < 0) {
+		XSEGLOG2(&lc, I, "Bucket pool is empty. Enqueuing work for ce "
+				"%p, pr %p", ce, pr);
 		cio->work.job_fn = reenter_handle_readwrite_claim;
 		cio->work.job = (void *)pr;
 		r = xwaitq_enqueue(&cached->bucket_waitq, &cio->work);
@@ -1690,7 +1758,6 @@ out:
 		cached_fail(peer, pr);
 	} else {
 		ce->status = CE_READY;
-		free_bucket_range(ce, start, end);
 		cached_complete(peer, pr);
 	}
 
