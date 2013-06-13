@@ -931,6 +931,25 @@ int xcache_remove(struct xcache *cache, xcache_handler h)
 	return r;
 }
 
+xcache_handler xcache_evict_lru(struct xcache *cache)
+{
+	struct xcache_entry *ce;
+	xcache_handler lru;
+
+	xlock_acquire(&cache->lock, 1);
+	lru = __xcache_evict_lru(cache);
+	xlock_release(&cache->lock);
+
+	if (lru != NoEntry) {
+		ce = &cache->nodes[lru];
+		if (cache->ops.on_evict)
+			cache->ops.on_evict(cache->priv, ce->priv);
+		xcache_entry_put(cache, lru);
+	}
+
+	return lru;
+}
+
 //This is just an atomic
 //	lookup
 //	remove if Found

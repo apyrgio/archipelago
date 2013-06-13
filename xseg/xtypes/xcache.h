@@ -178,6 +178,7 @@ xcache_handler xcache_alloc_init(struct xcache *cache, char *name);
 xcache_handler xcache_insert(struct xcache *cache, xcache_handler h);
 int xcache_remove(struct xcache *cache, xcache_handler h);
 int xcache_invalidate(struct xcache *cache, char *name);
+xcache_handler xcache_evict_lru(struct xcache *cache);
 void xcache_put(struct xcache *cache, xcache_handler h);
 void xcache_get(struct xcache *cache, xcache_handler h);
 uint64_t xcache_free_nodes(struct xcache *cache);

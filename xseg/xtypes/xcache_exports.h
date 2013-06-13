@@ -44,4 +44,5 @@ EXPORT_SYMBOL(xcache_put);
 EXPORT_SYMBOL(xcache_free_nodes);
 EXPORT_SYMBOL(xcache_free_new);
 EXPORT_SYMBOL(xcache_get);
+EXPORT_SYMBOL(xcache_evict_lru);
 
