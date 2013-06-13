@@ -111,6 +111,10 @@ struct cache_io {
 	struct work work;
 };
 
+struct cached_stats {
+	volatile uint64_t evicted;
+};
+
 struct cached {
 	struct xcache *cache;
 	uint64_t total_size; /* Total cache size (bytes) */
@@ -127,6 +131,7 @@ struct cached {
 	struct xwaitq req_waitq;
 	unsigned char *bucket_data;
 	struct xq bucket_indexes;
+	struct cached_stats stats;
 	//scheduler
 };
 
@@ -150,3 +155,4 @@ struct req_completion{
 	struct peer_req *pr;
 	struct xseg_request *req;
 };
+

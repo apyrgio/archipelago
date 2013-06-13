@@ -1000,16 +1000,22 @@ void on_reinsert(void *c, void *e)
 {
 	struct ce *ce = (struct ce *)e;
 	struct cache_io *ce_cio = ce->pr.priv;
+	struct peerd *peer = ce->pr.peer;
+	struct cached *cached = __get_cached(peer);
 
 	XSEGLOG2(&lc, I, "Re-inserted cache entry %p (h: %lu)", ce, ce_cio->h);
+	__sync_sub_and_fetch(&cached->stats.evicted, 1);
 }
 
 int on_evict(void *c, void *e)
 {
 	struct ce *ce = (struct ce *)e;
 	struct cache_io *ce_cio = ce->pr.priv;
+	struct peerd *peer = ce->pr.peer;
+	struct cached *cached = __get_cached(peer);
 
 	XSEGLOG2(&lc, I, "Evicted cache entry %p (h: %lu)", ce, ce_cio->h);
+	__sync_add_and_fetch(&cached->stats.evicted, 1);
 	return 0;
 }
 
@@ -1050,6 +1056,8 @@ void on_put(void *c, void *e)
 
 	XSEGLOG2(&lc, I, "Puting cache entry %p (ce_cio: %p, h: %lu)",
 			ce, ce_cio, ce_cio->h);
+
+	__sync_sub_and_fetch(&cached->stats.evicted, 1);
 
 	r = free_bucket_range(ce, 0, cached->buckets_per_object - 1);
 
@@ -2118,6 +2126,7 @@ int dispatch(struct peerd *peer, struct peer_req *pr, struct xseg_request *req,
 		enum dispatch_reason reason)
 {
 	struct cached *cached = __get_cached(peer);
+	struct xwaitq *bwaitq = &cached->bucket_waitq;
 
 	switch (reason) {
 		case dispatch_accept:
@@ -2132,10 +2141,22 @@ int dispatch(struct peerd *peer, struct peer_req *pr, struct xseg_request *req,
 	}
 
 	/*
+	 * If the bucket pool is empty but no object is in the process of
+	 * eviction, we have to manually evict the LRU object.
+	 */
+	if (!bucket_pool_not_empty(cached) &&
+			waiters_exist(bwaitq->q) &&
+			cached->stats.evicted == 0) {
+		XSEGLOG2(&lc, W, "Force eviction of LRU object");
+		xcache_evict_lru(cached->cache);
+	}
+
+	/*
 	 * Before returning, perform pending jobs.
 	 * This should probably be called before xseg_wait_signal.
 	 */
 	xworkq_signal(&cached->workq);
+
 	return 0;
 }
 
@@ -2165,6 +2186,7 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 		perror("malloc");
 		goto fail;
 	}
+	memset(cached, 0, sizeof(struct cached));
 	cached->cache = malloc(sizeof(struct xcache));
 	if (!cached->cache) {
 		perror("malloc");
