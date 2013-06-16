@@ -35,6 +35,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <sys/syscall.h>
 #include <pthread.h>
 #include <xseg/xseg.h>
 #include <peer.h>
@@ -90,9 +91,14 @@ static inline uint64_t __count_queue_size(struct xq *q)
 	return (uint64_t)xq_count(q);
 }
 
-static int waiters_exist(struct xq *q)
+static int waiters_exist(struct xwaitq *wq)
 {
-	return __count_queue_size(q) > 0;
+	return __count_queue_size(wq->q) > 0;
+}
+
+static int workers_exist(struct xworkq *wq)
+{
+	return __count_queue_size(wq->q) > 0;
 }
 
 /*
@@ -325,7 +331,8 @@ static int __free_bucket(struct ce *ce, struct bucket *b)
  * signal, if necessary.
  */
 static uint32_t free_bucket_range(struct ce *ce,
-		uint32_t start_bucket, uint32_t end_bucket)
+		uint32_t start_bucket, uint32_t end_bucket,
+		int safe_switch)
 {
 	struct peerd *peer = ce->pr.peer;
 	struct cached *cached = __get_cached(peer);
@@ -350,8 +357,10 @@ static uint32_t free_bucket_range(struct ce *ce,
 
 		data_status = __get_bucket_data_status(b);
 		/* Safe to free buckets are only valid/invalid buckets */
-		if (UNLIKELY(data_status != VALID && data_status != INVALID)) {
-			XSEGLOG2(&lc, E, "BUG: Unsafe bucket within range");
+		if (data_status != VALID) {
+			if (safe_switch)
+				XSEGLOG2(&lc, E, "BUG: Unsafe bucket (%u, %d) "
+						"within range", i, data_status);
 			continue;
 		}
 
@@ -779,9 +788,10 @@ static void flush_dirty_buckets(struct cached *cached, struct peer_req *pr)
 	struct cache_io *cio = pr->priv;
 	struct ce *ce = xcache_get_entry(cached->cache, cio->h);
 	struct bucket *b;
+	struct xwaitq *bwaitq = &cached->bucket_waitq;
 	uint32_t *bdc = ce->bucket_data_status_counters;
 	uint32_t end = cached->buckets_per_object - 1;
-	uint32_t i, first_dirty, last_dirty;
+	uint32_t i, r, first_dirty, last_dirty;
 	int data_status, alloc_status;
 
 	/* write all dirty buckets */
@@ -825,6 +835,18 @@ static void flush_dirty_buckets(struct cached *cached, struct peer_req *pr)
 		__set_bucket_data_status_range(ce, first_dirty, last_dirty, WRITING);
 		cio->pending_reqs++;
 	}
+
+	/*
+	 * If we have been flushed and there is no space left, free buckets
+	 * aggressively
+	 */
+	if (!bucket_pool_not_empty(cached) && waiters_exist(bwaitq)) {
+		r = free_bucket_range(ce, 0, end, 0);
+		if (r > 0) {
+			xworkq_enqueue(&cached->workq, signal_waitq, bwaitq);
+		}
+	}
+
 }
 
 /*
@@ -899,6 +921,36 @@ out:
 		XSEGLOG2(&lc, D, "Sent %lu flush request(s) to blocker",
 				cio->pending_reqs);
 	}
+}
+
+void force_flush_work(void *wq, void *arg)
+{
+	struct peer_req *pr = (struct peer_req *)arg;
+	struct peerd *peer = pr->peer;
+	struct cached *cached = peer->priv;
+	struct cache_io *cio = pr->priv;
+	struct ce *ce = xcache_get_entry(cached->cache, cio->h);
+	struct xwaitq *bwaitq = &cached->bucket_waitq;
+	uint32_t *bac = ce->bucket_alloc_status_counters;
+	uint32_t r;
+
+	XSEGLOG2(&lc, I, "Force-flushing cache entry %p (h: %lu)", ce, cio->h);
+
+	if (ce->status == CE_FLUSHING ||
+			bac[CLAIMED] == 0) {
+		cached_complete(peer, pr);
+		return;
+	}
+
+	if (__is_entry_clean(cached, ce)) {
+		r = free_bucket_range(ce, 0, cached->buckets_per_object - 1, 1);
+		if (r > 0) {
+			xworkq_enqueue(&cached->workq, signal_waitq, bwaitq);
+		}
+		return;
+	}
+
+	flush_work(wq, arg);
 }
 
 void *init_node(void *c, void *xh)
@@ -1059,13 +1111,13 @@ void on_put(void *c, void *e)
 
 	__sync_sub_and_fetch(&cached->stats.evicted, 1);
 
-	r = free_bucket_range(ce, 0, cached->buckets_per_object - 1);
+	r = free_bucket_range(ce, 0, cached->buckets_per_object - 1, 1);
 
 	/* This function is here simply to alert us if buckets are not clean */
 	//__are_buckets_clean(ce);
 
 	/* Enqueue a signal if there are any waiters in the bucket waitq */
-	if (r && waiters_exist(bwaitq->q))
+	if (r && waiters_exist(bwaitq))
 		xworkq_enqueue(&cached->workq, signal_waitq, bwaitq);
 }
 
@@ -1089,7 +1141,7 @@ void on_free(void *c, void *e)
 	 * Doesn't matter if signal can't be enqueued, pending_waitq will be
 	 * signalled eventually.
 	 */
-	if (waiters_exist(pwaitq->q))
+	if (waiters_exist(pwaitq))
 		xworkq_enqueue(&cached->workq, signal_waitq, pwaitq);
 }
 
@@ -1409,8 +1461,8 @@ static void handle_readwrite_claim(void *q, void *arg)
 	/* Try to claim the necessary buckets */
 	r = claim_bucket_range(ce, start_bucket, end_bucket);
 	if (r < 0) {
-		XSEGLOG2(&lc, I, "Bucket pool is empty. Enqueuing work for ce "
-				"%p, pr %p", ce, pr);
+		XSEGLOG2(&lc, I, "Bucket pool is empty.\n"
+				"\tEnqueuing work for ce %p, pr %p", ce, pr);
 		cio->work.job_fn = reenter_handle_readwrite_claim;
 		cio->work.job = (void *)pr;
 		r = xwaitq_enqueue(&cached->bucket_waitq, &cio->work);
@@ -1721,8 +1773,9 @@ static void complete_write_back(struct peerd *peer, struct peer_req *pr,
 	struct ce *ce = xcache_get_entry(cached->cache, cio->h);
 	struct bucket *b;
 	struct xwaitq *rwaitq = &cached->req_waitq;
+	struct xwaitq *bwaitq = &cached->bucket_waitq;
 	char *name = xcache_get_name(cached->cache, cio->h);
-	uint32_t i, start = -1, end = -1;
+	uint32_t i, r, start = -1, end = -1;
 	int success;
 
 	XSEGLOG2(&lc, D, "Started. Target is %s (h: %lu)", name, cio->h);
@@ -1745,8 +1798,19 @@ static void complete_write_back(struct peerd *peer, struct peer_req *pr,
 
 out:
 	xseg_put_request(peer->xseg, req, pr->portno);
-	if (waiters_exist(rwaitq->q)) {
+	if (waiters_exist(rwaitq)) {
 		xworkq_enqueue(&cached->workq, signal_waitq, rwaitq);
+	}
+
+	/*
+	 * If we have been flushed and there is no space left, free buckets
+	 * aggressively
+	 */
+	if (!bucket_pool_not_empty(cached) && waiters_exist(bwaitq)) {
+		r = free_bucket_range(ce, start, end, 1);
+		if (r > 0) {
+			xworkq_enqueue(&cached->workq, signal_waitq, bwaitq);
+		}
 	}
 
 	if (cio->pending_reqs){
@@ -2125,9 +2189,6 @@ static int handle_receive(struct peerd *peer, struct peer_req *pr,
 int dispatch(struct peerd *peer, struct peer_req *pr, struct xseg_request *req,
 		enum dispatch_reason reason)
 {
-	struct cached *cached = __get_cached(peer);
-	struct xwaitq *bwaitq = &cached->bucket_waitq;
-
 	switch (reason) {
 		case dispatch_accept:
 			handle_accept(peer, pr, req);
@@ -2140,23 +2201,112 @@ int dispatch(struct peerd *peer, struct peer_req *pr, struct xseg_request *req,
 			XSEGLOG2(&lc, E, "Invalid dispatch reason (%d)", reason);
 	}
 
-	/*
-	 * If the bucket pool is empty but no object is in the process of
-	 * eviction, we have to manually evict the LRU object.
-	 */
-	if (!bucket_pool_not_empty(cached) &&
-			waiters_exist(bwaitq->q) &&
-			cached->stats.evicted == 0) {
-		XSEGLOG2(&lc, W, "Force eviction of LRU object");
+	return 0;
+}
+
+static void force_reclaim_buckets(struct cached *cached)
+{
+	struct ce *ce;
+	uint32_t *bac;
+	xcache_handler lru;
+
+
+	if (!xlock_try_lock(&cached->stats.lock, 4))
+		return;
+
+	XSEGLOG2(&lc, D, "Started");
+
+	if (cached->stats.evicted)
+		goto out;
+
+	lru = xcache_peek_and_get_lru(cached->cache);
+	if (lru == NoEntry)
+		goto out;
+
+	ce = xcache_get_entry(cached->cache, lru);
+	if (!ce)
+		goto out;
+	XSEGLOG2(&lc, D, "LRU is %lu", lru);
+
+	bac = ce->bucket_alloc_status_counters;
+	if (bac[CLAIMED] > 0) {
+		if (ce->status != CE_FLUSHING) {
+			XSEGLOG2(&lc, I, "Force flush of LRU object");
+			xworkq_enqueue(&ce->workq, force_flush_work, (void *)&ce->pr);
+			xworkq_signal(&ce->workq);
+			goto out;
+		}
+	} else {
+		XSEGLOG2(&lc, I, "Force eviction of LRU object");
 		xcache_evict_lru(cached->cache);
 	}
+	xcache_put(cached->cache, lru);
 
-	/*
-	 * Before returning, perform pending jobs.
-	 * This should probably be called before xseg_wait_signal.
-	 */
-	xworkq_signal(&cached->workq);
+out:
+	xlock_release(&cached->stats.lock);
 
+	XSEGLOG2(&lc, D, "Finished");
+}
+
+/*
+ * generic_peerd_loop is a general-purpose port-checker loop that is
+ * suitable both for multi-threaded and single-threaded peers.
+ */
+static int custom_cached_loop(void *arg)
+{
+#ifdef MT
+	struct thread *t = (struct thread *) arg;
+	struct peerd *peer = t->peer;
+	char *id = t->arg;
+#else
+	struct peerd *peer = (struct peerd *) arg;
+	char id[4] = {'P','e','e','r'};
+#endif
+	struct xseg *xseg = peer->xseg;
+	xport portno_start = peer->portno_start;
+	xport portno_end = peer->portno_end;
+	pid_t pid = syscall(SYS_gettid);
+	uint64_t threshold=1000/(1 + portno_end - portno_start);
+	uint64_t loops;
+
+	struct cached *cached = __get_cached(peer);
+	struct xwaitq *bwaitq = &cached->bucket_waitq;
+
+	XSEGLOG2(&lc, I, "%s has tid %u.\n", id, pid);
+	xseg_init_local_signal(xseg, peer->portno_start);
+	//for (;!(isTerminate() && xq_count(&peer->free_reqs) == peer->nr_ops);) {
+#ifdef GPERF
+	ProfilerStart("/tmp/profile-cached1.prof");
+#endif
+	for (;!(isTerminate() && all_peer_reqs_free(peer));) {
+		//Heart of peerd_loop. This loop is common for everyone.
+		for(loops = threshold; loops > 0; loops--) {
+			if (loops == 1)
+				xseg_prepare_wait(xseg, peer->portno_start);
+#ifdef MT
+			if (check_ports(peer, t))
+#else
+			if (check_ports(peer))
+#endif
+				loops = threshold;
+
+			if (!bucket_pool_not_empty(cached) &&
+					waiters_exist(bwaitq) &&
+					!cached->stats.evicted)
+				force_reclaim_buckets(cached);
+
+			if (workers_exist(&cached->workq))
+				xworkq_signal(&cached->workq);
+		}
+
+		XSEGLOG2(&lc, I, "%s goes to sleep\n", id);
+		xseg_wait_signal(xseg, 10000000UL);
+		xseg_cancel_wait(xseg, peer->portno_start);
+		XSEGLOG2(&lc, I, "%s woke up\n", id);
+	}
+#ifdef GPERF
+	ProfilerStop();
+#endif
 	return 0;
 }
 
@@ -2193,6 +2343,7 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 		goto cache_fail;
 	}
 	peer->priv = cached;
+	xlock_release(&cached->stats.lock);
 
 	for (i = 0; i < peer->nr_ops; i++) {
 		struct cache_io *cio = malloc(sizeof(struct cache_io));
@@ -2350,6 +2501,9 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 
 	xseg_set_max_requests(peer->xseg, peer->portno_start, 10000);
 	xseg_set_freequeue_size(peer->xseg, peer->portno_start, 10000, 0);
+
+	peer->peerd_loop = custom_cached_loop;
+
 	print_cached(cached);
 	return 0;
 

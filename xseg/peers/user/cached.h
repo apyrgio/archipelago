@@ -56,7 +56,7 @@
 
 #define BUCKET_DATA_STATUSES 5
 #define BUCKET_DATA_STATUS_FLAG_POS 1
-#define BUCKET_DATA_STATUS_BITMASK 3
+#define BUCKET_DATA_STATUS_BITMASK 7	/* i.e. "111" in binary form */
 #define INVALID   0
 #define LOADING   1
 #define VALID     2
@@ -112,6 +112,7 @@ struct cache_io {
 };
 
 struct cached_stats {
+	struct xlock lock;
 	volatile uint64_t evicted;
 };
 
@@ -156,3 +157,4 @@ struct req_completion{
 	struct xseg_request *req;
 };
 
+static int custom_cached_loop(void *arg);
