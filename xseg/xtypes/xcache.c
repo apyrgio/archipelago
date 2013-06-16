@@ -950,6 +950,21 @@ xcache_handler xcache_evict_lru(struct xcache *cache)
 	return lru;
 }
 
+xcache_handler xcache_peek_and_get_lru(struct xcache *cache)
+{
+	xcache_handler lru;
+
+	xlock_acquire(&cache->lock, 1);
+	if (cache->lru == NULL)
+		return NoEntry;
+
+	lru = __get_idx(cache, cache->lru);
+	__xcache_entry_get(cache, lru);
+	xlock_release(&cache->lock);
+
+	return lru;
+}
+
 //This is just an atomic
 //	lookup
 //	remove if Found
