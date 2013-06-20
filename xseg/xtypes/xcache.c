@@ -428,16 +428,19 @@ static xcache_handler __xcache_insert_entries(struct xcache *cache, xcache_handl
  * xcache_entry_put is thread-safe even without cache->lock (cache->rm_lock is
  * crucial though). This is why:
  *
- * a. We put the entry's refcount. If it doesn't drop to zero, we can move on.
- * b. If it drops to zero, then we inform the peer that the cache entry is about
- *    to leave with the "on_evict" hook.
- * c. If peer returns a negative value, we do not free the entry yet and leave.
- * d. If everything is ok, we get the rm_lock.
- * e. Since rm_lock is needed for a re-insertion or a simple 'get' for this
- *    entry, we can safely check again the entry's ref here. If it's > 0, then
- *    someone beat us to it and has a job to do. If it's 0 though, then by
- *    removing the entry from "rm_entries" we are safe to free that entry
- *    without rm_lock.
+ * a. First, we acquire the ce->lock. Then we can atomically put the entry's
+ *    refcount and, if the refcount is not zero, return.
+ * b. Else, we update the "parallel_puts" field. This field protect us against
+ *    the ABA problem that occurs when a threads checks if the refcount has been
+ *    dropped to zero but not if it has been dropped, increased and then dropped
+ *    again.
+ * c. We release the ce->lock and can proceed locklessly to on_finalize.
+ * d. We acquire both ce->lock and cache->rm_lock. The ce->lock is needed to
+ *    be protected against parallel_puts and the cache->rm_lock is needed to
+ *    prevent re-insertions.
+ * e. If the entry is not reinserted and we are the only ones putting it,
+ *    we can safely remove it.
+ * f. Finally, we can proceed to putting and freeing the entry.
  */
 static void xcache_entry_put(struct xcache *cache, xqindex idx)
 {
@@ -445,27 +448,39 @@ static void xcache_entry_put(struct xcache *cache, xqindex idx)
 	unsigned long ref;
 
 	if (cache->flags & XCACHE_USE_RMTABLE) {
-		xlock_acquire(&cache->rm_lock, 1);
 
+		/* ---> Start of critical section: update of parallel_puts */
+		xlock_acquire(&ce->lock, 1);
 		ref = __sync_sub_and_fetch(&ce->ref, 1);
-		if (ref > 0)
-			goto out;
+		if (ref > 0) {
+			xlock_release(&ce->lock);
+			return;
+		}
+
+		ce->parallel_puts++;
+		xlock_release(&ce->lock);
+		/* <--- End of critical section */
 
 		if (cache->ops.on_finalize)
 			cache->ops.on_finalize(cache->priv, ce->priv);
 
 		/*
-		 * FIXME: BUG! Why? Say that on finalize has deemed that ce is clear.
-		 * If we get descheduled before getting rm_lock and in the meantime, the
-		 * cache entry is reinserted, dirtied and evicted? The ce->ref will be
-		 * zero but we shouldn't leave since there are still dirty buckets.
+		 * ---> Start of critical section: check for reinsertions or
+		 *  parallel puts and then remove the entry
 		 */
-		if (ce->ref != 0)
+		xlock_acquire(&ce->lock, 1);
+		xlock_acquire(&cache->rm_lock, 2);
+
+		if (ce->ref > 0 || ce->parallel_puts > 1)
 			goto out;
 		if (__xcache_remove_rm(cache, idx) < 0)
 			goto out;
 
+		ce->parallel_puts--;
+
 		xlock_release(&cache->rm_lock);
+		xlock_release(&ce->lock);
+		/* <--- End of critical section */
 	} else if ( __sync_sub_and_fetch(&ce->ref, 1) > 0) {
 		return;
 	}
@@ -478,7 +493,9 @@ static void xcache_entry_put(struct xcache *cache, xqindex idx)
 	return;
 
 out:	/* For XCACHE_USE_RMTABLE only */
+	ce->parallel_puts--;
 	xlock_release(&cache->rm_lock);
+	xlock_release(&ce->lock);
 }
 
 static int xcache_entry_init(struct xcache *cache, xqindex idx, char *name)
@@ -882,6 +899,7 @@ int xcache_init(struct xcache *cache, uint32_t xcache_size,
 	if (cache->ops.on_node_init){
 		for (i = 0; i < cache->nr_nodes; i++) {
 			ce = &cache->nodes[i];
+			ce->parallel_puts = 0;
 			ce->ref = 0;
 			/* FIXME: Is (void *) typecast necessary? */
 			ce->priv = cache->ops.on_node_init(cache->priv, (void *)&i);
