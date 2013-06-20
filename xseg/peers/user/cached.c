@@ -96,11 +96,6 @@ static int waiters_exist(struct xwaitq *wq)
 	return __count_queue_size(wq->q) > 0;
 }
 
-static int workers_exist(struct xworkq *wq)
-{
-	return __count_queue_size(wq->q) > 0;
-}
-
 /*
  * Signal a waitq.
  */
@@ -111,24 +106,7 @@ static void signal_waitq(void *q, void *arg)
 	xwaitq_signal(waitq);
 }
 
-/*
- * Signal a workq.
- */
-//WORK
-static void signal_workq(void *q, void *arg)
-{
-	struct xworkq *workq = (struct xworkq *)arg;
-	xworkq_signal(workq);
-}
-
 /* Bucket specific operations */
-#if 0
-static inline unsigned char *__get_bucket_data(struct bucket *b)
-{
-	return cached->bucket_data + (idx * cached->bucket_size);
-}
-#endif
-
 static inline int __get_bucket_alloc_status(struct bucket *b)
 {
 	return GET_FLAG(BUCKET_ALLOC_STATUS, b->flags);
@@ -183,17 +161,6 @@ static inline int __is_bucket_claimed(struct bucket *b)
 {
 	return __get_bucket_alloc_status(b) == CLAIMED;
 }
-
-#if 0
-static inline void __update_bucket_status_counters(struct ce *ce,
-		uint32_t bucket, uint32_t new_status)
-{
-	uint32_t old_status = ce->bucket_status[bucket];
-
-	ce->bucket_status_counters[old_status]--;
-	ce->bucket_status_counters[new_status]++;
-}
-#endif
 
 static uint32_t __get_bucket(struct cached *cache, uint64_t offset)
 {
@@ -499,6 +466,7 @@ static int __is_entry_clean(struct cached *cached, struct ce *ce)
 	return 0;
 }
 
+__attribute__ ((unused))
 static int __are_buckets_clean(struct ce *ce)
 {
 	struct peerd *peer = ce->pr.peer;
@@ -1819,11 +1787,6 @@ out:
 		return;
 	}
 
-	/*
-	if (xworkq_enqueue(&cached->workq, signal_workq, &ce->deferred_workq) < 0)
-		cio->state = CIO_FAILED;
-	*/
-
 	/* FIXME: Handle failings properly */
 	if (cio->state == CIO_FAILED) {
 		ce->status = CE_FAILED;
@@ -2295,8 +2258,7 @@ static int custom_cached_loop(void *arg)
 					!cached->stats.evicted)
 				force_reclaim_buckets(cached);
 
-			if (workers_exist(&cached->workq))
-				xworkq_signal(&cached->workq);
+			xworkq_signal(&cached->workq);
 		}
 
 		XSEGLOG2(&lc, I, "%s goes to sleep\n", id);
