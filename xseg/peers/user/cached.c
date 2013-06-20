@@ -437,6 +437,14 @@ static int req_pool_not_empty(void *arg)
 	return __count_free_reqs(port, xseg) > 0;
 }
 
+/* Requests can go to blocker only when ce isn't on flushing or deleting state */
+static int can_send_to_blocker(void *arg)
+{
+	struct ce *ce = (struct ce *)arg;
+
+	return (ce->status != CE_FLUSHING && ce->status != CE_DELETING);
+}
+
 __attribute__ ((unused))
 static void __print_bc(uint32_t *bc) {
 	XSEGLOG("Bucket statuses:\n"
@@ -455,7 +463,7 @@ static int __is_entry_clean(struct cached *cached, struct ce *ce)
 
 	if (cached->write_policy == WRITETHROUGH ||
 			ce->status == CE_INVALIDATED ||
-			bdc[DIRTY] == 0)
+			bdc[INVALID] + bdc[VALID] == cached->buckets_per_object)
 		return 1;
 
 	if (ce->status == CE_FLUSHING || ce->status == CE_DELETING)
@@ -837,6 +845,35 @@ static void flush_dirty_buckets(struct cached *cached, struct peer_req *pr)
  * If writeback has occurred during eviction, the last put will check again if
  * dirty buckets exist and if needed it will issue a new flush.
  */
+void flush_work(void *wq, void *arg);
+
+static void reenter_flush_work(void *q, void *arg)
+{
+	struct peer_req *pr = (struct peer_req *)arg;
+	struct peerd *peer = pr->peer;
+	struct cached *cached = __get_cached(peer);
+	struct cache_io *cio = __get_cache_io(pr);
+	struct ce *ce = xcache_get_entry(cached->cache, cio->h);
+	int r;
+
+	XSEGLOG2(&lc, D, "Started for %p (h: %lu, pr: %p)", ce, cio->h, pr);
+
+	r = xworkq_enqueue(&ce->workq, flush_work, (void *)pr);
+
+	/*
+	 * Calling xworkq_signal here is harmless, since it will fail if we
+	 * already have the lock
+	 */
+	if (r >= 0) {
+		xworkq_signal(&ce->workq);
+	} else {
+		XSEGLOG2(&lc, E, "Failing pr %p", pr);
+		cached_fail(peer, pr);
+	}
+
+	XSEGLOG2(&lc, D, "Finished for %p (h: %lu, pr: %p)", ce, cio->h, pr);
+}
+
 //WORK
 void flush_work(void *wq, void *arg)
 {
@@ -848,40 +885,22 @@ void flush_work(void *wq, void *arg)
 
 	XSEGLOG2(&lc, I, "Flushing cache entry %p (h: %lu)", ce, cio->h);
 
-	if (wq == &ce->deferred_workq) {
-		XSEGLOG2(&lc, W, "ce %p and pr %p is in deferred workq", ce, pr);
-	}
-
 	if (__is_entry_clean(cached, ce)) {
 		cached_complete(peer, pr);
 		return;
 	}
 
-	/*
-	 * FIXME: What if we are already on deferred workq? Then if we enqueue our
-	 * job, it will be signalled immediately
-	 */
 	if (ce->status == CE_DELETING || ce->status == CE_FLUSHING) {
 		XSEGLOG2(&lc, W, "Blocker cannot receive flush request "
 				"(ce: %p, ce->status: %lu)", ce, ce->status);
-		if (wq == &ce->deferred_workq) {
-			XSEGLOG2(&lc, W, "Cannot enqueue to deferred workq of ce %p", ce);
-			xworkq_enqueue(&ce->workq, flush_work, (void *)pr);
-			xworkq_enqueue(&cached->workq, signal_workq, (void *)&ce->workq);
-			return;
-		}
-		if (xworkq_enqueue(&ce->deferred_workq, flush_work, (void *)pr) < 0) {
-			cio->state = CIO_FAILED;
-			XSEGLOG2(&lc, E, "Error: cannot enqueue request");
-			goto out;
-		}
-		return;
+		cio->work.job_fn = reenter_flush_work;
+		cio->work.job = (void *)pr;
+		xwaitq_enqueue(&ce->pending_waitq, &cio->work);
 	}
 
 	ce->status = CE_FLUSHING;
 	flush_dirty_buckets(cached, pr);
 
-out:
 	/* FIXME: Handle failing of requests */
 	if (cio->state == CIO_FAILED) {
 		XSEGLOG2(&lc, E, "Flush failed");
@@ -965,7 +984,7 @@ void *init_node(void *c, void *xh)
 	ce_cio->h = h;
 
 	xworkq_init(&ce->workq, &ce->lock, 0);
-	xworkq_init(&ce->deferred_workq, &ce->lock, 0);
+	xwaitq_init(&ce->pending_waitq, can_send_to_blocker, ce, 0);
 	return ce;
 
 ce_fields_fail:
@@ -1044,7 +1063,8 @@ int on_finalize(void *c, void *e)
 	struct peerd *peer = (struct peerd *)c;
 	struct cached *cached = peer->priv;
 	struct ce *ce = (struct ce *)e;
-	struct cache_io *ce_cio = ce->pr.priv;
+	struct peer_req *pr = &ce->pr;
+	struct cache_io *ce_cio = pr->priv;
 
 	XSEGLOG2(&lc, I, "Finalizing cache entry %p (h: %lu)", ce, ce_cio->h);
 
@@ -1052,17 +1072,11 @@ int on_finalize(void *c, void *e)
 		return 0;
 
 	xcache_get(cached->cache, ce_cio->h);
-	if (xworkq_enqueue(&ce->workq, flush_work, (void *)&ce->pr) < 0)
-		goto fail;
-	if (xworkq_enqueue(&cached->workq, signal_workq, (void *)&ce->workq) < 0)
-		goto fail;
-
+	ce_cio->work.job_fn = reenter_flush_work;
+	ce_cio->work.job = (void *)pr;
+	/* Handle fails properly */
+	xwaitq_enqueue(&ce->pending_waitq, &ce_cio->work);
 	return 1;
-
-fail:
-	XSEGLOG2(&lc, E, "Cannot flush dirty entry %p (h: %lu)", ce, ce_cio->h);
-	return 1;
-
 }
 
 void on_put(void *c, void *e)
@@ -1078,6 +1092,9 @@ void on_put(void *c, void *e)
 			ce, ce_cio, ce_cio->h);
 
 	__sync_sub_and_fetch(&cached->stats.evicted, 1);
+
+	if (waiters_exist(&ce->pending_waitq))
+		XSEGLOG2(&lc, W, "BUG: There are waiters in pending waitq!");
 
 	r = free_bucket_range(ce, 0, cached->buckets_per_object - 1, 1);
 
@@ -1796,6 +1813,7 @@ out:
 		cached_complete(peer, pr);
 	}
 
+	xwaitq_signal(&ce->pending_waitq);
 
 	XSEGLOG2(&lc, D, "Finished");
 	return;
@@ -2193,7 +2211,7 @@ static void force_reclaim_buckets(struct cached *cached)
 
 	bac = ce->bucket_alloc_status_counters;
 	if (bac[CLAIMED] > 0) {
-		if (ce->status != CE_FLUSHING) {
+		if (ce->status != CE_FLUSHING && ce->status != CE_DELETING) {
 			XSEGLOG2(&lc, I, "Force flush of LRU object");
 			xworkq_enqueue(&ce->workq, force_flush_work, (void *)&ce->pr);
 			xworkq_signal(&ce->workq);

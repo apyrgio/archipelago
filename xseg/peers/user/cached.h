@@ -148,7 +148,7 @@ struct ce {
 	struct bucket *buckets;
 	struct xlock lock;		/* cache entry lock */
 	struct xworkq workq;		/* workq of the cache entry */
-	struct xworkq deferred_workq;		/* async workq for TODO */
+	struct xwaitq pending_waitq;
 	struct peer_req pr;
 };
 
