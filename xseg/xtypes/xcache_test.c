@@ -42,6 +42,8 @@
 
 unsigned long sum_put = 0;
 unsigned long sum_free = 0;
+unsigned long sum_evict = 0;
+unsigned long sum_reinsert = 0;
 unsigned long sum = 0;
 struct xlock lock;
 uint32_t lru = 0;
@@ -63,6 +65,7 @@ struct thread_arg{
 	struct xcache *cache;
 	unsigned long tid;
 	unsigned long n;
+	void *priv;
 };
 
 void *thread_test1(void *arg)
@@ -174,6 +177,17 @@ void free_unsafe(void *c, void *e)
 void free_safe(void *c, void *e)
 {
 	__sync_add_and_fetch(&sum_free, 1);
+}
+
+void reinsert_safe(void *c, void *e)
+{
+	__sync_add_and_fetch(&sum_reinsert, 1);
+}
+
+int evict_safe(void *c, void *e)
+{
+	__sync_add_and_fetch(&sum_evict, 1);
+	return 0;
 }
 
 void put_safe(void *c, void *e)
@@ -930,6 +944,426 @@ int test3(unsigned long cache_size, unsigned long nr_threads)
 	return 0;
 }
 
+void *thread_test4_part1(void *arg)
+{
+	struct thread_arg *targ = (struct thread_arg *)arg;
+	struct xcache *cache = targ->cache;
+	int rc;
+	unsigned long n = targ->n, i = 0;
+	unsigned long tid = targ->tid;
+	xcache_handler h, nh;
+	char name[XSEG_MAX_TARGETLEN];
+	unsigned long *handlers = (unsigned long *)targ->priv;
+
+	/* The entries inserted by each thread ammount to the cache's size */
+	for (i = 0; i < n; i++) {
+		sprintf(name, "tid:%lu_i:%lu_v1", tid, i);
+		h = xcache_alloc_init(cache, name);
+		if (h == NoEntry) {
+			fprintf(stderr, "Could not allocate cache entry\n");
+			return NULL;
+		}
+		nh = xcache_insert(cache, h);
+		if (nh == NoEntry){
+			fprintf(stderr, "Could not insert cache entry\n");
+			return NULL;
+		} else if (nh != h) {
+			fprintf(stderr, "Other cache entry found\n");
+			return NULL;
+		}
+		handlers[i] = nh;
+	}
+
+	PT_BARRIER()
+
+	/* Alternate between inserting a new enrty and putting the old one */
+	for (i = 0; i < n; i++) {
+		xcache_put(cache, handlers[i]);
+
+		sprintf(name, "tid:%lu_i:%lu_v2", tid, i);
+		h = xcache_alloc_init(cache, name);
+		if (h == NoEntry) {
+			fprintf(stderr, "Could not allocate cache entry\n");
+			return NULL;
+		}
+		nh = xcache_insert(cache, h);
+		if (nh == NoEntry){
+			fprintf(stderr, "Could not insert cache entry\n");
+			return NULL;
+		} else if (nh != h) {
+			fprintf(stderr, "Other cache entry found\n");
+			return NULL;
+		}
+		handlers[i] = nh;
+	}
+	return (void *)i;
+}
+
+void *thread_test4_part2a(void *arg)
+{
+	struct thread_arg *targ = (struct thread_arg *)arg;
+	struct xcache *cache = targ->cache;
+	unsigned long n = targ->n, i = 0;
+	xcache_handler nh;
+	unsigned long *handlers = (unsigned long *)targ->priv;
+
+	/* The entries inserted by each thread ammount to the cache's size */
+	for (i = 0; i < n; i++) {
+		nh = xcache_insert(cache, handlers[i]);
+		if (nh == NoEntry){
+			fprintf(stderr, "Could not insert cache entry\n");
+			return NULL;
+		} else if (nh != handlers[i]) {
+			fprintf(stderr, "Other cache entry found\n");
+			return NULL;
+		}
+	}
+	return (void *)i;
+}
+
+void *thread_test4_part2b(void *arg)
+{
+	struct thread_arg *targ = (struct thread_arg *)arg;
+	struct xcache *cache = targ->cache;
+	unsigned long n = targ->n, i = 0;
+	unsigned long tid = targ->tid;
+	xcache_handler h, nh;
+	char name[XSEG_MAX_TARGETLEN];
+	unsigned long *handlers = (unsigned long *)targ->priv;
+
+	/* The entries inserted by each thread ammount to the cache's size */
+	for (i = 0; i < n; i++) {
+		sprintf(name, "tid:%lu_i:%lu_v3", tid, i);
+		h = xcache_alloc_init(cache, name);
+		if (h == NoEntry) {
+			fprintf(stderr, "Could not allocate cache entry\n");
+			return NULL;
+		}
+		nh = xcache_insert(cache, h);
+		if (nh == NoEntry){
+			fprintf(stderr, "Could not insert cache entry\n");
+			return NULL;
+		} else if (nh != h) {
+			fprintf(stderr, "Other cache entry found\n");
+			return NULL;
+		}
+		handlers[i] = nh;
+	}
+	return (void *)i;
+}
+
+void *thread_test4_part3a(void *arg)
+{
+	struct thread_arg *targ = (struct thread_arg *)arg;
+	struct xcache *cache = targ->cache;
+	unsigned long n = targ->n, i = 0;
+	unsigned long invalidations = 0;
+	unsigned long tid = targ->tid;
+	char name[XSEG_MAX_TARGETLEN];
+	int r;
+
+	do {
+		sprintf(name, "tid:%lu_i:%lu_v2", tid, i);
+		r =  xcache_invalidate(cache, name);
+		if (r >= 0){
+			invalidations++;
+		}
+	} while (++i < n);
+
+	return (void *)invalidations;
+}
+
+void *thread_test4_part3b(void *arg)
+{
+	struct thread_arg *targ = (struct thread_arg *)arg;
+	struct xcache *cache = targ->cache;
+	unsigned long n = targ->n, i = 0;
+	unsigned long invalidations = 0;
+	unsigned long tid = targ->tid;
+	char name[XSEG_MAX_TARGETLEN];
+	int r;
+
+	do {
+		sprintf(name, "tid:%lu_i:%lu_v3", tid, i);
+		r =  xcache_invalidate(cache, name);
+		if (r >= 0){
+			invalidations++;
+		}
+
+	} while (++i < n);
+
+	return (void *)invalidations;
+}
+
+void *thread_test4_part4(void *arg)
+{
+	struct thread_arg *targ = (struct thread_arg *)arg;
+	struct xcache *cache = targ->cache;
+	unsigned long n = targ->n, i = 0;
+	unsigned long tid = targ->tid;
+	xcache_handler h, nh;
+	char name[XSEG_MAX_TARGETLEN];
+	unsigned long *handlers = (unsigned long *)targ->priv;
+
+	/* The entries inserted by each thread ammount to the cache's size */
+	for (i = 0; i < n; i++) {
+		sprintf(name, "tid:%lu_i:%lu_v4", tid, i);
+		h = xcache_alloc_init(cache, name);
+		if (h == NoEntry) {
+			fprintf(stderr, "Could not allocate cache entry\n");
+			return NULL;
+		}
+		nh = xcache_insert(cache, h);
+		if (nh == NoEntry){
+			fprintf(stderr, "Could not insert cache entry\n");
+			return NULL;
+		} else if (nh != h) {
+			fprintf(stderr, "Other cache entry found\n");
+			return NULL;
+		}
+		handlers[i] = nh;
+		xcache_evict_lru(cache);
+	}
+	return (void *)i;
+}
+
+void *thread_test4_part5(void *arg)
+{
+	struct thread_arg *targ = (struct thread_arg *)arg;
+	struct xcache *cache = targ->cache;
+	unsigned long n = cache->size, i = 0, j = 0;
+
+	for (i = 0; i < 2 * n; i++)
+		xcache_put(cache, i);
+	for (j = 0; j < 3; j++) {
+		for (i = 0; i < 2 * n; i++)
+			xcache_get(cache, i);
+		for (i = 0; i < 2 * n; i++)
+			xcache_put(cache, i);
+	}
+	for (i = 0; i < 2 * n; i++)
+		xcache_put(cache, i);
+
+	return (void *)i;
+}
+
+int test4(unsigned long cache_size, unsigned long nr_threads)
+{
+	struct xcache cache;
+	struct xcache_ops c_ops = {
+		.on_init = init,
+		.on_evict = evict_safe,
+		.on_reinsert = reinsert_safe,
+		.on_put = put_safe,
+		.on_free = free_safe,
+		.on_node_init = node_init
+	};
+	struct timeval start, end, tv;
+	int r, i;
+	unsigned long n, invalidations;
+	void *ret;
+
+	/* Initialisations */
+	xcache_init(&cache, cache_size, &c_ops, lru | XCACHE_USE_RMTABLE, NULL);
+
+	if (cache.size % nr_threads != 0 || nr_threads < 2) {
+		fprintf(stderr, "Number of threads is not suitable for this test\n");
+		return -1;
+	}
+
+	struct thread_arg *targs = malloc(nr_threads * sizeof(struct thread_arg));
+	pthread_t *threads = malloc(nr_threads * sizeof(pthread_t));
+
+	n = cache.size / nr_threads * 2;
+	for (i = 0; i < nr_threads; i++) {
+		targs[i].tid = i+1;
+		targs[i].n = n;
+		targs[i].cache = &cache;
+		targs[i].priv = calloc(n, sizeof(unsigned long));
+		if (!targs[i].priv)
+			return -1;
+	}
+
+	pthread_barrier_init(&barr, NULL, nr_threads / 2);
+
+	/*
+	 * PART 1: Insert entries (v1) until cache is full. Then, each thread
+	 * alternates between putting a v1 entry and inserting a new entry (v2).
+	 * The ammount of v2 entries is as much as the cache's size.
+	 * EXPECTATION: The v1 entries will all be put and the v2 ones will be
+	 * settled in cache.
+	 */
+	sum_free = 0;
+	sum_put = 0;
+
+	gettimeofday(&start, NULL);
+	/* We use only half threads for this */
+	for (i = 0; i < nr_threads; i += 2) {
+		r = pthread_create(&threads[i], NULL, thread_test4_part1, &targs[i]);
+		if (r) {
+			fprintf(stderr, "error pthread_create\n");
+			return -1;
+		}
+	}
+
+	for (i = 0; i < nr_threads; i += 2) {
+		pthread_join(threads[i], &ret);
+	}
+	gettimeofday(&end, NULL);
+
+	if (sum_put != cache.size || sum_free != cache.size) {
+		fprintf(stderr, "Test 4, part1: sum_put: %lu, expected %u\n",
+				sum_put, cache.size);
+		fprintf(stderr, "Test 4, part1: sum_free: %lu, expected %u\n",
+				sum_free, cache.size);
+		return -1;
+	}
+
+	timersub(&end, &start, &tv);
+	fprintf(stderr, "Part1: PASSED in "
+			"%ds %dusec\n\n", (int)tv.tv_sec, (int)tv.tv_usec);
+
+	/*
+	 * PART 2: Half threads re-insert the v2 entries while the other half
+	 * insert new ones (v3).
+	 * EXPECTATION: There will be no puts since the v2 and v3 entries are
+	 * still referenced. They will all reside in cache but half of these
+	 * entries will be in evicted state.
+	 */
+	sum_put = 0;
+	sum_free = 0;
+	sum_reinsert = 0;
+	sum_evict = 0;
+
+	gettimeofday(&start, NULL);
+	for (i = 0; i < nr_threads; i++) {
+		if (i % 2 == 0)
+			r = pthread_create(&threads[i], NULL,
+					thread_test4_part2a, &targs[i]);
+		else
+			r = pthread_create(&threads[i], NULL,
+					thread_test4_part2b, &targs[i]);
+
+		if (r) {
+			fprintf(stderr, "error pthread_create\n");
+			return -1;
+		}
+	}
+
+	for (i = 0; i < nr_threads; i++) {
+		pthread_join(threads[i], &ret);
+	}
+	gettimeofday(&end, NULL);
+
+	if (sum_put != 0 || sum_evict - sum_reinsert != cache.size) {
+		fprintf(stderr, "Test 4, part2: sum_put: %lu, expected 0\n",
+				sum_put);
+		fprintf(stderr, "Test 4, part2: sum_evict - sum_reinsert = "
+				"%lu - %lu != %u",
+				sum_evict, sum_reinsert, cache.size);
+		return -1;
+	}
+
+	timersub(&end, &start, &tv);
+	fprintf(stderr, "Part2: PASSED in "
+			"%ds %dusec\n\n", (int)tv.tv_sec, (int)tv.tv_usec);
+
+	/*
+	 * PART 3: Invalidate all entries.
+	 * EXPECTATION: There will be 2 * cache.size invalidations/puts/frees
+	 */
+	sum_put = 0;
+	sum_free = 0;
+	sum_reinsert = 0;
+	sum_evict = 0;
+	invalidations = 0;
+
+	gettimeofday(&start, NULL);
+	for (i = 0; i < nr_threads; i++) {
+		if (i % 2 == 0)
+			r = pthread_create(&threads[i], NULL,
+					thread_test4_part3a, &targs[i]);
+		else
+			r = pthread_create(&threads[i], NULL,
+					thread_test4_part3b, &targs[i]);
+
+		if (r) {
+			fprintf(stderr, "error pthread_create\n");
+			return -1;
+		}
+	}
+
+	for (i = 0; i < nr_threads; i++) {
+		pthread_join(threads[i], &ret);
+		invalidations += (unsigned long)ret;
+	}
+	gettimeofday(&end, NULL);
+
+	if (invalidations != 2 * cache.size ||
+			sum_put != 0 ||
+			sum_free != 0) {
+		fprintf(stderr, "Test 4, part3: invalidations: %lu, expected %u\n",
+				invalidations, 2 * cache.size);
+		fprintf(stderr, "Test 4, part3: sum_put: %lu, expected 0\n",
+				sum_put);
+		fprintf(stderr, "Test 4, part3: sum_free: %lu, expected 0\n",
+				sum_free);
+		return -1;
+	}
+
+	timersub(&end, &start, &tv);
+	fprintf(stderr, "Part3: PASSED in "
+			"%ds %dusec\n\n", (int)tv.tv_sec, (int)tv.tv_usec);
+
+	xcache_close(&cache);
+
+	if (sum_put != cache.size || sum_free != cache.size) {
+		fprintf(stderr, "Test 4, part3.5: sum_put: %lu, expected %u\n",
+				sum_put, cache.size);
+		fprintf(stderr, "Test 4, part3.5: sum_free: %lu, expected %u\n",
+				sum_free, cache.size);
+		return -1;
+	}
+
+	/*
+	 * PART 4: Insert new entries (v4) and evict them.
+	 * EXPECTATION: There will be cache.size evictions and no puts
+	 */
+	sum_put = 0;
+	sum_free = 0;
+	sum_reinsert = 0;
+	sum_evict = 0;
+
+	gettimeofday(&start, NULL);
+	for (i = 0; i < nr_threads; i++) {
+		r = pthread_create(&threads[i], NULL,
+				thread_test4_part4, &targs[i]);
+		if (r) {
+			fprintf(stderr, "error pthread_create\n");
+			return -1;
+		}
+	}
+
+	for (i = 0; i < nr_threads; i++) {
+		pthread_join(threads[i], &ret);
+	}
+	gettimeofday(&end, NULL);
+
+	if (sum_evict != cache.size || sum_put != 0) {
+		fprintf(stderr, "Test 4, part4: sum_evict: %lu, expected %u\n",
+				sum_evict, cache.size);
+		fprintf(stderr, "Test 4, part4: sum_put: %lu, expected 0\n",
+				sum_put);
+		return -1;
+	}
+
+	timersub(&end, &start, &tv);
+	fprintf(stderr, "Part4: PASSED in "
+			"%ds %dusec\n\n", (int)tv.tv_sec, (int)tv.tv_usec);
+
+	return 0;
+}
+
 void usage()
 {
 	fprintf(stdout,
@@ -964,7 +1398,7 @@ int main(int argc, const char *argv[])
 	int cache_size = atoi(argv[1]);
 	int lru_type = atoi(argv[2]);
 	int t = atoi(argv[3]);
-	int n = atoi(argv[4]);
+	int pref = atoi(argv[4]);
 
 	switch (lru_type) {
 		case XCACHE_LRU_ARRAY:
@@ -980,7 +1414,16 @@ int main(int argc, const char *argv[])
 			fprintf(stderr, "Wrong LRU type. Exiting...\n");
 			return -1;
 	}
+
+	if (pref < 0 || pref > 1) {
+		usage();
+		fprintf(stderr, "Wrong preference\n");
+		return -1;
+	}
+
 	lru = lru_type;
+	if (pref == 1)
+		goto rmtable;
 
 	fprintf(stderr, "Running test1\n");
 	gettimeofday(&start, NULL);
@@ -999,12 +1442,12 @@ int main(int argc, const char *argv[])
 	r = test2(cache_size, t);
 	gettimeofday(&end, NULL);
 	timersub(&end, &start, &tv);
-	fprintf(stderr, "Test time: %ds %dusec\n\n", (int)tv.tv_sec, (int)tv.tv_usec);
 	if (r < 0){
 		fprintf(stderr, "test2: failed\n");
 		return -1;
 	}
 	fprintf(stderr, "test2: PASSED\n");
+	fprintf(stderr, "Test time: %ds %dusec\n\n", (int)tv.tv_sec, (int)tv.tv_usec);
 
 	XSEGLOG("Starting new test");
 	fprintf(stderr, "running test3\n");
@@ -1016,7 +1459,21 @@ int main(int argc, const char *argv[])
 	}
 	gettimeofday(&end, NULL);
 	timersub(&end, &start, &tv);
-	fprintf(stderr, "Test time: %ds %dusec\n\n", (int)tv.tv_sec, (int)tv.tv_usec);
 	fprintf(stderr, "test3: PASSED\n");
+	fprintf(stderr, "Test time: %ds %dusec\n\n", (int)tv.tv_sec, (int)tv.tv_usec);
+
+rmtable:
+	XSEGLOG("Starting new test\n");
+	fprintf(stderr, "Running Test 4\n");
+	gettimeofday(&start, NULL);
+	r = test4(cache_size, t);
+	if (r < 0){
+		fprintf(stderr, "Test 4: failed\n");
+		return -1;
+	}
+	gettimeofday(&end, NULL);
+	fprintf(stderr, "Test 4: PASSED\n");
+	timersub(&end, &start, &tv);
+	fprintf(stderr, "Test time: %ds %dusec\n\n", (int)tv.tv_sec, (int)tv.tv_usec);
 	return 0;
 }
