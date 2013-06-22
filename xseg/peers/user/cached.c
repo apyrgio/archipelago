@@ -2120,6 +2120,9 @@ static int handle_accept(struct peerd *peer, struct peer_req *pr,
 			handle_snapshot(peer, pr);
 			break;
 #endif
+		case X_PING:
+			complete(peer, pr);
+			break;
 		default:
 			/* In all other cases, defer request to blocker */
 			if (canDefer(peer)){
