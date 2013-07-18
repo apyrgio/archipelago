@@ -46,118 +46,11 @@
 #include <xtypes/xwaitq.h>
 #include <xseg/protocol.h>
 #include <xtypes/xcache.h>
-
-#define MAX_ARG_LEN 12
-
-/* bucket statuses
- *
- * Allocation status occupies 1st-2nd flag bit.
- * Data status occupied 2nd-4th flag bit.
- */
-
-#define BUCKET_ALLOC_STATUSES 2
-#define BUCKET_ALLOC_STATUS_FLAG_POS 0
-#define BUCKET_ALLOC_STATUS_BITMASK 1
-#define FREE 0
-#define CLAIMED   1
-
-#define BUCKET_DATA_STATUSES 5
-#define BUCKET_DATA_STATUS_FLAG_POS 1
-#define BUCKET_DATA_STATUS_BITMASK 3
-#define INVALID   0
-#define LOADING   1
-#define VALID     2
-#define DIRTY     3
-#define WRITING   4
-
-/*
- * Find position of flag, make it zero, get requested flag value, store it to
- * this position
- */
-#define SET_FLAG(__ftype, __flag, __val)	\
-	__flag = (__flag & ~((uint32_t)__ftype##_BITMASK << __ftype##_FLAG_POS)) | \
-	((uint32_t)__val << __ftype##_FLAG_POS);
-
-/* Apply bitmask to flags, shift result to the right to get correct value */
-#define GET_FLAG(__ftype, __flag)			\
-	(__flag & ((uint64_t)__ftype##_BITMASK << __ftype##_FLAG_POS)) >> \
-	(uint32_t)__ftype##_FLAG_POS
-
-/* write policies */
-#define WRITETHROUGH 1
-#define WRITEBACK    2
-
-#define WRITE_POLICY(__wcp)				\
-	(__wcp == WRITETHROUGH	? "writethrough" :	\
-	__wcp == WRITEBACK	? "writeback"	 :	\
-	"undefined")
-
-/* cio states */
-#define CIO_FAILED		1
-#define CIO_ACCEPTED		2
-#define CIO_READING		3
-#define CIO_WRITING		4
-#define CIO_SERVED		5
-
-/* ce states */
-#define CE_READY		1
-#define CE_WRITING		2
-#define CE_FLUSHING		3
-#define CE_DELETING		4
-#define CE_INVALIDATED		5
-#define CE_FAILED		6
-
-#define BUCKET_SIZE_QUANTUM 4096
-
-struct cache_io {
-	uint32_t state;
-	xcache_handler h;
-	uint32_t pending_reqs;
-	struct work work;
-};
-
-struct cached {
-	struct xcache *cache;
-	uint64_t cache_size; /*Number of objects*/
-	uint64_t max_req_size;
-	uint32_t object_size; /*Bytes*/
-	uint32_t bucket_size; /*In bytes*/
-	uint32_t buckets_per_object;
-	xport bportno;
-	int write_policy;
-	struct xworkq workq;
-	struct xwaitq pending_waitq;
-	unsigned char *bucket_data;
-	struct xq bucket_idx;
-	//scheduler
-};
-
-struct bucket {
-	xqindex data;
-	uint32_t flags;
-};
-
-struct ce {
-	uint32_t status;		/* cache entry status */
-	uint32_t *bucket_alloc_status_counters;
-	uint32_t *bucket_data_status_counters;
-	struct bucket *buckets;
-	struct xlock lock;		/* cache entry lock */
-	struct xworkq workq;		/* workq of the cache entry */
-	struct xworkq deferred_workq;		/* async workq for TODO */
-	struct peer_req pr;
-};
-
-struct req_completion{
-	struct peer_req *pr;
-	struct xseg_request *req;
-};
+#include <cached.h>
 
 /*
  * Helper functions
  */
-
-#define MIN(__a__, __b__) ((__a__ < __b__) ? __a__ : __b__)
 
 static inline struct cached * __get_cached(struct peerd *peer)
 {
@@ -193,10 +86,12 @@ static inline int __is_handler_valid(xcache_handler h)
 }
 
 /* Bucket specific operations */
+#if 0
 static inline unsigned char *__get_bucket_data(struct bucket *b)
 {
-	return (unsigned char *)b->data;
+	return cached->bucket_data + (idx * cached->bucket_size);
 }
+#endif
 
 static inline int __get_bucket_alloc_status(struct bucket *b)
 {
@@ -301,25 +196,57 @@ static uint32_t __get_last_dirty(struct ce *ce, uint32_t start, uint32_t limit)
 	return __get_last_per_status(ce, start, limit, DIRTY);
 }
 
+/*
+ * BUCKET CLAIMING:
+ * During cached_init, we pre-allocate a fixed number of buckets. These buckets
+ * can serve as the data for the cached objects. The bucket data is actually a
+ * huge malloced space of "cached->total_size" bytes.
+ *
+ * To index this space, we utilize a thread-safe stack where bucket indexes can
+ * be pushed and popped. The cache is thread-safe because it's locked, but in
+ * the future it can be lock free.
+ *
+ * The process is the following:
+ *
+ * 1) When a new request arrives and its target object is inserted in cache,
+ * handle_readwrite_claim() is called with the cache entry lock.
+ * 2) handle_readwrite_claim() calls claim_bucket_range() to pop the necessary
+ * data indexes from the stack.
+ * 3) If the stack is empty, we cannot spin forever. Instead, a job is enqueued
+ * in cached's bucket waitq that will be signalled when a new index has been
+ * pushed in the stack. Subsequently, this job will call the
+ * handle_readwrite_claim() function with the cache entry lock held to continue
+ * its job.
+ * 4) Finally, when all buckets have been claimed, the request can proceed to
+ * the actual work (handle_read or handle_write) depending on its XSEG operation
+ * type.
+ */
+
 static int claim_bucket(struct ce *ce, uint32_t bucket_no)
 {
 	struct peerd *peer = ce->pr.peer;
 	struct cached *cached = __get_cached(peer);
 	struct bucket *b = &ce->buckets[bucket_no];
-	xqindex idx;
+	xqindex index;
 
-	idx = xq_pop_head(&cached->bucket_idx, 1);
-	if (idx == Noneidx) {
-		XSEGLOG2(&lc, E, "Could not claim bucket");
+	index = xq_pop_head(&cached->bucket_indexes, 1);
+	if (index == Noneidx) {
+		XSEGLOG2(&lc, D, "Could not claim bucket");
 		return -1;
 	}
 
 	__set_bucket_alloc_status(ce, b, CLAIMED);
-	b->data = cached->bucket_data + (idx * cached->bucket_size);
+	b->data = cached->bucket_data + (index * cached->bucket_size);
+	XSEGLOG2(&lc, D, "Bucket %u is at address %p (ce: %p)",
+			bucket_no, b->data, ce);
 
 	return 0;
 }
 
+/*
+ * claim_bucket_range() iterates all buckets and tries to claim space from the
+ * shared memory pool.
+ */
 static int claim_bucket_range(struct ce *ce,
 		uint32_t start_bucket, uint32_t end_bucket)
 {
@@ -336,29 +263,79 @@ static int claim_bucket_range(struct ce *ce,
 			continue;
 
 		r = claim_bucket(ce, i);
-		if (r < 0) {
-			/* FIXME: Enqueue work */
-			XSEGLOG2(&lc, E, "Could not claim bucket %u for ce %p",
-					i, ce);
+		if (r < 0)
 			return r;
-		}
 	}
 
 	return 0;
 }
 
+static void free_bucket(struct ce *ce, struct bucket *b)
+{
+	struct peerd *peer = ce->pr.peer;
+	struct cached *cached = __get_cached(peer);
+	xqindex index;
+
+	index = (b->data - cached->bucket_data) / cached->bucket_size;
+
+	__set_bucket_alloc_status(ce, b, FREE);
+	if (UNLIKELY(xq_append_head(&cached->bucket_indexes, index, 1) == Noneidx))
+		XSEGLOG("BUG: Could not free bucket index. Queue is full");
+}
+
+/*
+ * free_buckets_ce() iterates all ce buckets and tries to free every claimed
+ * bucket.
+ */
+static void free_buckets_ce(struct ce *ce)
+{
+	struct peerd *peer = ce->pr.peer;
+	struct cached *cached = __get_cached(peer);
+	struct bucket *b;
+	uint32_t *bac = ce->bucket_alloc_status_counters;
+	uint32_t i;
+	int status;
+
+	XSEGLOG2(&lc, D, "Started for ce %p", ce);
+
+	for (i = 0; i < cached->buckets_per_object; i++) {
+		b = &ce->buckets[i];
+		status = __get_bucket_alloc_status(b);
+
+		if (status == FREE)
+			continue;
+
+		free_bucket(ce, b);
+	}
+
+	if (bac[CLAIMED] == 0)
+		XSEGLOG2(&lc, I, "All buckets freed (ce: %p)", ce);
+	else
+		XSEGLOG2(&lc, E, "BUG: There are still claimed buckets "
+				"(ce: %p)", ce);
+}
+
 static void rw_bucket(struct bucket *b, int op, unsigned char *data,
 		uint64_t offset, uint64_t size)
 {
-	unsigned char *to, *from;
+	unsigned char *to = NULL;
+	unsigned char *from = NULL;
 
 	if (op == X_WRITE) {
-		to = __get_bucket_data(b) + offset;
+		to = b->data + offset;
 		from = data;
 	} else if (op == X_READ) {
 		to = data;
-		from = __get_bucket_data(b) + offset;
+		from = b->data + offset;
 	}
+
+	if (!to || !from) {
+		XSEGLOG2(&lc, D, "Wrong memory address");
+		return;
+	}
+
+	XSEGLOG2(&lc, D, "Writing from %p to %p, offset %lu and size %lu",
+			from, to, offset, size);
 	memcpy(to, from, size);
 }
 
@@ -376,6 +353,7 @@ static void rw_bucket_range(struct ce *ce, int op, unsigned char *data,
 	end_bucket = __get_bucket(cached, offset + size - 1);
 
 	for (i = start_bucket; i <= end_bucket; i++) {
+		XSEGLOG2(&lc, D, "Bucket %u", i);
 		b = &ce->buckets[i];
 		/*
 		 * 1. Calculate offset inside bucket
@@ -387,12 +365,26 @@ static void rw_bucket_range(struct ce *ce, int op, unsigned char *data,
 
 		rw_bucket(b, op, data, bucket_offset, data_size);
 
+		if (op == X_READ)
+			data += data_size;
+
 		size -= data_size;
-		offset -= bucket_offset;
+		offset += bucket_offset;
 	}
 
-	if (size > 0 || offset > 0)
+	if (size > 0)
 		XSEGLOG2(&lc, E, "Read/write error");
+}
+
+static inline uint64_t __count_free_buckets(struct cached *cached)
+{
+	return (uint64_t)xq_count(&cached->bucket_indexes);
+}
+
+static int bucket_pool_not_empty(void *arg)
+{
+	struct cached *cached = (struct cached *)arg;
+	return __count_free_buckets(cached) > 0;
 }
 
 static int cache_not_full(void *arg)
@@ -451,14 +443,14 @@ static void print_cached(struct cached *cached)
 
 	XSEGLOG2(&lc, I, "Struct cached fields:\n"
 			"                     cache        = %p\n"
-			"                     cache_size   = %lu\n"
+			"                     max_objects   = %lu\n"
 			"                     max_req_size = %lu\n"
 			"                     object_size  = %lu\n"
 			"                     bucket_size  = %lu\n"
 			"                     bucks_per_obj= %lu\n"
 			"                     Bportno      = %d\n"
 			"                     write_policy = %s\n",
-			cached->cache, cached->cache_size, cached->max_req_size,
+			cached->cache, cached->max_objects, cached->max_req_size,
 			cached->object_size, cached->bucket_size,
 			cached->buckets_per_object, cached->bportno,
 			WRITE_POLICY(cached->write_policy));
@@ -623,7 +615,8 @@ static int rw_range(struct peerd *peer, struct peer_req *pr, uint32_t op,
 	xport dstport = cached->bportno;
 	xport p;
 	xcache_handler h = cio->h;
-	char *req_target, *req_data;
+	char *req_target;
+	unsigned char *req_data;
 	int r;
 	char *target;
 	uint32_t targetlen;
@@ -663,8 +656,9 @@ static int rw_range(struct peerd *peer, struct peer_req *pr, uint32_t op,
 	strncpy(req_target, target, targetlen);
 
 	if (req->op == X_WRITE) {
-		 req_data = xseg_get_data(xseg, req);
-		 //memcpy(req_data, ce->data + req->offset, req->size);
+		 req_data = (unsigned char *)xseg_get_data(xseg, req);
+		 /* Read from buket into the request buffer */
+		 rw_bucket_range(ce, X_READ, req_data, req->offset, req->size);
 	}
 
 	/* Set request data */
@@ -955,7 +949,9 @@ void on_free(void *c, void *e)
 	 * Doesn't matter if signal can't be enqueued, pending_waitq will be
 	 * signalled eventually.
 	 */
+	free_buckets_ce(ce);
 	xworkq_enqueue(&cached->workq, signal_waitq, &cached->pending_waitq);
+	xworkq_enqueue(&cached->workq, signal_waitq, &cached->bucket_waitq);
 }
 
 struct xcache_ops c_ops = {
@@ -1209,6 +1205,42 @@ out:
 	XSEGLOG2(&lc, D, "Finished for %p (h: %lu, pr: %p)", ce, cio->h, pr);
 }
 
+static void handle_readwrite_claim(void *q, void *arg);
+
+/*
+ * reenter_handle_readwrite_claim() acts as a context-swicher for
+ * handle_readwrite_claim(). Its main purpose is to enqueue
+ * handle_readwrite_claim() as a ce job i.e. change from cached context to ce
+ * context.
+ */
+static void reenter_handle_readwrite_claim(void *q, void *arg)
+{
+	struct peer_req *pr = (struct peer_req *)arg;
+	struct peerd *peer = pr->peer;
+	struct cached *cached = __get_cached(peer);
+	struct cache_io *cio = __get_cache_io(pr);
+	struct ce *ce = xcache_get_entry(cached->cache, cio->h);
+	int r;
+
+	XSEGLOG2(&lc, D, "Started for %p (h: %lu, pr: %p)", ce, cio->h, pr);
+
+	r = xworkq_enqueue(&ce->workq, handle_readwrite_claim, (void *)pr);
+	if (r >= 0) {
+		xworkq_signal(&ce->workq);
+	} else {
+		XSEGLOG2(&lc, E, "Failing pr %p", pr);
+		cached_fail(peer, pr);
+	}
+
+	XSEGLOG2(&lc, D, "Finished for %p (h: %lu, pr: %p)", ce, cio->h, pr);
+}
+
+/*
+ * handle_readwrite_claim() tries to claim the necessary object data buckets to
+ * complete the request.  If it can't, it enqueues a job to call
+ * handle_read_write_claim() when a bucket is available. You can read more in the
+ * "Bucket claiming" section.
+ */
 static void handle_readwrite_claim(void *q, void *arg)
 {
 	struct peer_req *pr = (struct peer_req *)arg;
@@ -1217,7 +1249,6 @@ static void handle_readwrite_claim(void *q, void *arg)
 	struct cache_io *cio = __get_cache_io(pr);
 	struct ce *ce = (struct ce *)xcache_get_entry(cached->cache, cio->h);
 	struct xseg_request *req = pr->req;
-	char *target = xseg_get_target(peer->xseg, req);
 	uint32_t start_bucket, end_bucket;
 	int r;
 
@@ -1232,34 +1263,36 @@ static void handle_readwrite_claim(void *q, void *arg)
 	XSEGLOG2(&lc, D, "Trying to claim buckets [%u, %u]",
 			start_bucket, end_bucket);
 
+	/* Try to claim the necessary buckets */
 	r = claim_bucket_range(ce, start_bucket, end_bucket);
-	/* FIXME: No this is wrong */
-	if (r < 0)
-		goto fail;
+	if (r < 0) {
+		cio->work.job_fn = reenter_handle_readwrite_claim;
+		cio->work.job = (void *)pr;
+		r = xwaitq_enqueue(&cached->bucket_waitq, &cio->work);
+		return;
+	}
 
+	/* If all buckets are claimed, proceed to the actual work */
 	switch (req->op) {
 		case X_WRITE:
 			handle_write(q, arg);
-			goto out;
+			break;
 		case X_READ:
 			handle_read(q, arg);
-			goto out;
+			break;
 		default:
 			XSEGLOG2(&lc, E, "Invalid op %u", req->op);
+			cached_fail(peer, pr);
 	}
 
-fail:
-	XSEGLOG2(&lc, E, "Failing pr %p", pr);
-	cached_fail(peer, pr);
-out:
 	XSEGLOG2(&lc, D, "Finished");
 }
 
 /*
  * handle_readwrite is called when we accept a read/write request.
  * Its purpose is to find a handler associated with the request's target (cache
- * hit) or insert a new one (cache miss). Then, the request will be enqueued as
- * a work according to the XSEG opeation type (read/write).
+ * hit) or insert a new one (cache miss). Then, a work will be enqueued for this
+ * request to claim the necessary buckets.
  *
  * Problematic scenarios:
  * a. (alloc) The cache can become full, which leaves no room for insertion. The
@@ -1279,11 +1312,11 @@ static void handle_readwrite(void *q, void *arg)
 	struct cache_io *cio = __get_cache_io(pr);
 	struct ce *ce;
 	struct xseg_request *req = pr->req;
+	xcache_handler h = NoEntry;
+	xcache_handler nh;
 	char name[XSEG_MAX_TARGETLEN + 1];
 	char *target;
 	int r = 0;
-	xcache_handler h = NoEntry;
-	xcache_handler nh;
 
 	//TODO: assert req->size != 0 --> complete req
 	//assert (req->offset % cached->bucket_size) == 0;
@@ -1318,7 +1351,6 @@ static void handle_readwrite(void *q, void *arg)
 		if (!__is_handler_valid(nh)) {
 			XSEGLOG2(&lc, E, "Could not insert cache entry");
 			xcache_free_new(cached->cache, h);
-			r = -1;
 			goto out;
 		} else if (nh != h) {
 			/* if insert returns another cache entry than the one we
@@ -1348,17 +1380,13 @@ static void handle_readwrite(void *q, void *arg)
 
 	XSEGLOG2(&lc, I, "Target %s is in cache (h: %lu)", name, h);
 
-	r = xworkq_enqueue(&ce->workq, handle_readwrite_claim, (void *)pr);
-	if (r >= 0)
-		xworkq_signal(&ce->workq);
-
-out:
-	if (r < 0) {
-		XSEGLOG2(&lc, E, "Failing pr %p", pr);
-		cached_fail(peer, pr);
-	}
-
+	/* TODO: Pick a better name */
+	reenter_handle_readwrite_claim(q, arg);
 	XSEGLOG2(&lc, D, "Finished");
+	return;
+out:
+	if (r < 0)
+		cached_fail(peer, pr);
 }
 
 /*
@@ -1971,13 +1999,17 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 {
 	int i;
 	char bucket_size[MAX_ARG_LEN + 1];
+	char total_size[MAX_ARG_LEN + 1];
+	char max_objects[MAX_ARG_LEN + 1];
 	char object_size[MAX_ARG_LEN + 1];
 	char max_req_size[MAX_ARG_LEN + 1];
 	char write_policy[MAX_ARG_LEN + 1];
+	uint64_t total_buckets;
 	long bportno = -1;
-	long cache_size = -1;
 	int r;
 
+	total_size[0] = 0;
+	max_objects[0] = 0;
 	bucket_size[0] = 0;
 	object_size[0] = 0;
 	max_req_size[0] = 0;
@@ -2009,11 +2041,12 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 
 	/* Read arguments */
 	BEGIN_READ_ARGS(argc, argv);
-	READ_ARG_ULONG("-bp", bportno);
-	READ_ARG_ULONG("-cs", cache_size);
+	READ_ARG_STRING("-ts", total_size, MAX_ARG_LEN);
+	READ_ARG_STRING("-mo", max_objects, MAX_ARG_LEN);
 	READ_ARG_STRING("-mrs", max_req_size, MAX_ARG_LEN);
 	READ_ARG_STRING("-os", object_size, MAX_ARG_LEN);
 	READ_ARG_STRING("-bs", bucket_size, MAX_ARG_LEN);
+	READ_ARG_ULONG("-bp", bportno);
 	READ_ARG_STRING("-wcp", write_policy, MAX_ARG_LEN);
 	END_READ_ARGS();
 
@@ -2063,11 +2096,33 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 		goto arg_fail;
 	}
 
-	/* Cache size */
-	if (cache_size < 0)
-		cache_size = peer->nr_ops;
+	/* Total size */
+	if (!total_size[0]) {
+		XSEGLOG2(&lc, E, "Total size must be provided");
+		goto arg_fail;
+	}
 
-	cached->cache_size = cache_size;
+	cached->total_size = str2num(total_size);
+	if (!cached->total_size) {
+		XSEGLOG2(&lc, E, "Invalid syntax: -ts %s\n", total_size);
+		goto arg_fail;
+	}
+	if (cached->total_size % BUCKET_SIZE_QUANTUM) {
+		XSEGLOG2(&lc, E, "Misaligned total size: %s\n",
+				total_size);
+		goto arg_fail;
+	}
+
+	/* Max objects */
+	if (!max_objects[0])
+		cached->max_objects = peer->nr_ops;
+	else
+		cached->max_objects = str2num(max_objects);
+
+	if (!cached->max_objects) {
+		XSEGLOG2(&lc, E, "Invalid syntax: -mo %s\n", max_objects);
+		goto arg_fail;
+	}
 
 	/* Blocker port */
 	if (bportno < 0){
@@ -2090,30 +2145,31 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 
 	/* Initialize xcache and queues */
 	cached->buckets_per_object = cached->object_size / cached->bucket_size;
-	r = xcache_init(cached->cache, cached->cache_size,
+	r = xcache_init(cached->cache, cached->max_objects,
 			&c_ops, XCACHE_LRU_O1 | XCACHE_USE_RMTABLE, peer);
 	if (r < 0) {
 		XSEGLOG2(&lc, E, "Could initialize cache");
 		goto arg_fail;
 	}
-	cached->cache_size = cached->cache->size; /* cache size may have changed
+	cached->max_objects = cached->cache->size; /* cache size may have changed
 						     if not power of 2 */
-	if (cached->cache_size < peer->nr_ops){
+	if (cached->max_objects < peer->nr_ops){
 		XSEGLOG2(&lc, E, "Cache size should be at least nr_ops\n"
 				 "\tEffective cache size %u < nr_ops: %u",
-				 cached->cache_size, peer->nr_ops);
+				 cached->max_objects, peer->nr_ops);
 		goto arg_fail;
 	}
 
 	/* Initialize buckets */
-	cached->bucket_data = malloc(cached->object_size * cached->cache_size);
+	cached->bucket_data = malloc(cached->total_size);
 	if (!cached->bucket_data) {
 		XSEGLOG2(&lc, E, "Cannot allocate enough space for bucket data");
 		goto cio_fail;
 	}
-	if (!xq_alloc_seq(&cached->bucket_idx,
-				cached->object_size * cached->cache_size,
-				cached->object_size * cached->cache_size)){
+
+	total_buckets = cached->total_size / cached->bucket_size;
+
+	if (!xq_alloc_seq(&cached->bucket_indexes, total_buckets, total_buckets)) {
 		XSEGLOG2(&lc, E, "Cannot create bucket index");
 		return -1;
 	}
@@ -2121,9 +2177,10 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	/* Initialize workqs/waitqs */
 	xworkq_init(&cached->workq, NULL, 0);
 	xwaitq_init(&cached->pending_waitq, cache_not_full, cached, 0);
+	xwaitq_init(&cached->bucket_waitq, bucket_pool_not_empty, cached, 0);
 
-	xseg_set_max_requests(peer->xseg, peer->portno_start, 10000);
-	xseg_set_freequeue_size(peer->xseg, peer->portno_start, 10000, 0);
+	//xseg_set_max_requests(peer->xseg, peer->portno_start, 10000);
+	//xseg_set_freequeue_size(peer->xseg, peer->portno_start, 10000, 0);
 	print_cached(cached);
 	return 0;
 
@@ -2150,10 +2207,11 @@ void custom_peer_usage()
 {
 	fprintf(stderr, "Custom peer options: \n"
 			"  ------------------------------------------------\n"
-			"    -cs       | Number of ops | Number of objects to cache\n"
-			"    -mrs      | 512KiB        | Max request size\n"
+			"    -mo       | Number of ops | Max objects to cache\n"
+			"    -ts       | None          | Total cache size\n"
 			"    -os       | 4MiB          | Object size\n"
 			"    -bs       | 4KiB          | Bucket size\n"
+			"    -mrs      | 512KiB        | Max request size\n"
 			"    -bp       | None          | Blocker port\n"
 			"    -wcp      | writethrough  | Write policy [writethrough|writeback]\n"
 			"\n");
