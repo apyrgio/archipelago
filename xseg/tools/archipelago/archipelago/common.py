@@ -57,7 +57,7 @@ import random
 random.seed()
 hostname = socket.gethostname()
 
-valid_role_types = ['file_blocker', 'rados_blocker', 'mapperd', 'vlmcd']
+valid_role_types = ['file_blocker', 'rados_blocker', 'mapperd', 'vlmcd', 'cached']
 valid_segment_types = ['segdev', 'posix']
 
 peers = dict()
@@ -90,6 +90,7 @@ FILE_BLOCKER = 'archip-filed'
 RADOS_BLOCKER = 'archip-sosd'
 MAPPER = 'archip-mapperd'
 VLMC = 'archip-vlmcd'
+CACHED = 'archip-cached'
 
 def is_power2(x):
     return bool(x != 0 and (x & (x-1)) == 0)
@@ -366,6 +367,47 @@ class Vlmcd(Peer):
             self.cli_opts.append("-mp")
             self.cli_opts.append(str(self.mapper_port))
 
+class Cached(MTpeer):
+    def __init__(self, cache_size=None, object_size=None, bucket_size=None,
+            max_request_size=None, blocker_port=None, policy=None,
+            cache_objects=None, **kwargs):
+        self.executable = CACHED
+        self.cache_size = cache_size
+        self.object_size = object_size
+        self.bucket_size = bucket_size
+        self.max_request_size = max_request_size
+        self.blocker_port = blocker_port
+        self.policy = policy
+        self.cache_objects = cache_objects
+        super(Cached, self).__init__(**kwargs)
+
+        if self.cli_opts is None:
+            self.cli_opts = []
+        self.set_cached_cli_options()
+
+    def set_cached_cli_options(self):
+        if self.cache_objects is not None:
+            self.cli_opts.append("-mo")
+            self.cli_opts.append(str(self.cache_objects))
+        if self.cache_size is not None:
+            self.cli_opts.append("-ts")
+            self.cli_opts.append(self.cache_size)
+        if self.object_size is not None:
+            self.cli_opts.append("-os")
+            self.cli_opts.append(self.object_size)
+        if self.bucket_size is not None:
+            self.cli_opts.append("-bs")
+            self.cli_opts.append(self.bucket_size)
+        if self.max_request_size is not None:
+            self.cli_opts.append("-mrs")
+            self.cli_opts.append(self.max_request_size)
+        if self.blocker_port is not None:
+            self.cli_opts.append("-bp")
+            self.cli_opts.append(str(self.blocker_port))
+        if self.policy is not None:
+            self.cli_opts.append("-wcp")
+            self.cli_opts.append(self.policy)
+
 
 config = {
     'CEPH_CONF_FILE': '/etc/ceph/ceph.conf',
@@ -537,6 +579,9 @@ def check_conf():
         elif role_type == 'vlmcd':
             peers[role] = Vlmcd(role=role, spec=segment.get_spec(),
                                 **role_config)
+        elif role_type == 'cached':
+            peers[role] = Cached(role=role, spec=config['SPEC'].encode(),
+                                 **role_config)
         else:
             raise Error("No valid peer type: %s" % role_type)
         validatePortRange(peers[role].portno_start, peers[role].portno_end,
