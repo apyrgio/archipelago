@@ -33,7 +33,7 @@
 
 import archipelago
 from archipelago.common import Xseg_ctx, Request, Filed, Mapperd, Vlmcd, Sosd, \
-        Error, Segment
+        Error, Segment, Cached
 from archipelago.archipelago import start_peer, stop_peer
 import random as rnd
 import unittest2 as unittest
@@ -434,6 +434,9 @@ class XsegTest(unittest.TestCase):
 
         cluster.shutdown()
         return Sosd(**args)
+
+    def get_cached(self, args):
+        return Cached(**args)
 
     def get_mapperd(self, args):
         return Mapperd(**args)
@@ -1153,6 +1156,51 @@ class SosdTest(BlockerTest, XsegTest):
     def tearDown(self):
         stop_peer(self.blocker)
         super(SosdTest, self).tearDown()
+
+class CachedTest(BlockerTest, XsegTest):
+    filed_args = {
+            'role': 'testfiled',
+            'spec': XsegTest.spec,
+            'nr_ops': 16,
+            'archip_dir': '/tmp/filedtest/',
+            'prefix': 'archip_',
+            'portno_start': 0,
+            'portno_end': 0,
+            'daemon': True,
+            'log_level': 3,
+            }
+
+    cached_args = {
+            'role': 'testcached',
+            'spec': XsegTest.spec,
+            'nr_ops': 16,
+            'portno_start': 1,
+            'portno_end': 1,
+            'daemon': True,
+            'log_level': 3,
+	    'cache_size' : '32M',
+            'blocker_port' : 0,
+	    #'policy' : 'writeback',
+	    'cache_objects' : 16
+            }
+
+    def setUp(self):
+        super(CachedTest, self).setUp()
+        try:
+            self.realblocker = self.get_filed(self.filed_args, clean=True)
+            self.blocker = self.get_cached(self.cached_args)
+            self.blockerport = self.blocker.portno_start
+            start_peer(self.realblocker)
+            start_peer(self.blocker)
+        except Exception as e:
+	    stop_peer(self.realblocker)
+            super(CachedTest, self).tearDown()
+            raise e
+
+    def tearDown(self):
+        stop_peer(self.blocker)
+        stop_peer(self.realblocker)
+        super(CachedTest, self).tearDown()
 
 if __name__=='__main__':
     init()
