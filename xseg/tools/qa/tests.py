@@ -1071,6 +1071,11 @@ class BlockerTest(object):
         self.send_and_evaluate_hash(self.blockerport, target, size=datalen,
                 expected_data=ret, serviced=datalen)
 
+
+    def restart_blocker(self):
+        stop_peer(self.blocker)
+        start_peer(self.blocker)
+
     def test_locking(self):
         target = "mytarget"
         self.send_and_evaluate_acquire(self.blockerport, target, expected=True)
@@ -1078,8 +1083,7 @@ class BlockerTest(object):
         self.send_and_evaluate_release(self.blockerport, target, expected=True)
         self.send_and_evaluate_release(self.blockerport, target, expected=False)
         self.send_and_evaluate_acquire(self.blockerport, target, expected=True)
-        stop_peer(self.blocker)
-        start_peer(self.blocker)
+        self.restart_blocker()
         self.send_and_evaluate_acquire(self.blockerport, target, expected=False)
         self.send_and_evaluate_release(self.blockerport, target, expected=False)
         self.send_and_evaluate_release(self.blockerport, target, force=True,
@@ -1113,22 +1117,12 @@ class FiledTest(BlockerTest, XsegTest):
         stop_peer(self.blocker)
         super(FiledTest, self).tearDown()
 
-    def test_locking(self):
-        target = "mytarget"
-        self.send_and_evaluate_acquire(self.blockerport, target, expected=True)
-        self.send_and_evaluate_acquire(self.blockerport, target, expected=True)
-        self.send_and_evaluate_release(self.blockerport, target, expected=True)
-        self.send_and_evaluate_release(self.blockerport, target, expected=False)
-        self.send_and_evaluate_acquire(self.blockerport, target, expected=True)
+    def restart_blocker(self):
         stop_peer(self.blocker)
         new_filed_args = copy(self.filed_args)
         new_filed_args['unique_str'] = 'ThisisSparta'
         self.blocker = Filed(**new_filed_args)
         start_peer(self.blocker)
-        self.send_and_evaluate_acquire(self.blockerport, target, expected=False)
-        self.send_and_evaluate_release(self.blockerport, target, expected=False)
-        self.send_and_evaluate_release(self.blockerport, target, force=True,
-                expected=True)
 
 class SosdTest(BlockerTest, XsegTest):
     filed_args = {
@@ -1193,6 +1187,7 @@ class CachedTest(BlockerTest, XsegTest):
             start_peer(self.realblocker)
             start_peer(self.blocker)
         except Exception as e:
+            stop_peer(self.blocker)
 	    stop_peer(self.realblocker)
             super(CachedTest, self).tearDown()
             raise e
@@ -1201,6 +1196,17 @@ class CachedTest(BlockerTest, XsegTest):
         stop_peer(self.blocker)
         stop_peer(self.realblocker)
         super(CachedTest, self).tearDown()
+
+    def restart_blocker(self):
+        stop_peer(self.blocker)
+        stop_peer(self.realblocker)
+        new_filed_args = copy(self.filed_args)
+        new_filed_args['unique_str'] = 'ThisisSparta'
+        self.realblocker = Filed(**new_filed_args)
+        start_peer(self.realblocker)
+        start_peer(self.blocker)
+
+
 
 if __name__=='__main__':
     init()
