@@ -2074,7 +2074,7 @@ static int handle_derailed(struct peerd *peer, struct peer_req *pr,
 
 	XSEGLOG2(&lc, W, "Request has other port destination.\n"
 			"\tBlocker port is %u while dst port is %u.",
-			req->dst_portno, cached->bportno);
+			cached->bportno, req->dst_portno);
 
 	p = xseg_submit(peer->xseg, req, cached->bportno, X_ALLOC);
 	if (p == NoPort) {
@@ -2096,8 +2096,13 @@ static int handle_accept(struct peerd *peer, struct peer_req *pr,
 
 	XSEGLOG2(&lc, D, "Started");
 
-	/* Handle the scenario where a request has different target port than ours */
-	if (req->dst_portno != cached->bportno){
+	/*
+	 * Handle the scenario where a request has different target port than
+	 * ours and doesn't target us.
+	 */
+	if (req->dst_portno != cached->bportno &&
+			(req->dst_portno < peer->portno_start ||
+			 req->dst_portno > peer->portno_end)) {
 		r = handle_derailed(peer, pr, req);
 		goto out;
 	}
@@ -2430,6 +2435,7 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 		goto arg_fail;
 	}
 	cached->bportno = bportno;
+	peer->defer_portno = bportno;
 
 	/* Write policy */
 	if (!write_policy[0]) {
