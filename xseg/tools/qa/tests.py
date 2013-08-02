@@ -41,6 +41,7 @@ from xseg.xprotocol import *
 from xseg.xseg_api import *
 import ctypes
 import os
+import sys
 from copy import copy
 from sets import Set
 from binascii import hexlify, unhexlify
@@ -82,12 +83,44 @@ def merkle_hash(hashes):
     while len(hashes) > 1 :
         hashes = [sha256(hashes[i] + hashes[i + 1]).digest() for i in range (0, len(hashes), 2)]
     return hashes[0]
-    
+
+CUSTOM_OPTS = """\
+
+Custom options:
+  --bpath          Use binaries from this path
+  --lpath          Store logs in this path
+"""
 
 def init():
     rnd.seed()
-#    archipelago.common.BIN_DIR=os.path.join(os.getcwd(), '../../peers/user/')
-    archipelago.common.LOGS_PATH=os.path.join(os.getcwd(), 'logs')
+
+    # Default log path is /tmp/{test_name}_log
+    file_name = sys.argv[0].replace('.py','')
+    log_path = '/tmp/' + file_name + '-log'
+
+    # Add our own help messages in the usage section
+    sep = "\nExamples:\n"
+    split_usage = unittest.TestProgram.USAGE.split(sep, 1)
+    unittest.TestProgram.USAGE = (split_usage[0] + CUSTOM_OPTS + sep +
+                                  split_usage[1])
+
+    # Read and remove custom options
+    try:
+        index = sys.argv.index('--bpath')
+        value = sys.argv.pop(index + 1)
+        sys.argv.remove('--bpath')
+        archipelago.common.BIN_DIR=os.path.join(os.getcwd(), value)
+    except Exception:
+        pass
+    try:
+        index = sys.argv.index('--lpath')
+        value = sys.argv.pop(index + 1)
+        sys.argv.remove('--lpath')
+        log_path = value
+    except Exception:
+        pass
+
+    archipelago.common.LOGS_PATH=os.path.join(os.getcwd(), log_path)
     archipelago.common.PIDFILE_PATH=os.path.join(os.getcwd(), 'pids')
     if not os.path.isdir(archipelago.common.LOGS_PATH):
         os.makedirs(archipelago.common.LOGS_PATH)
