@@ -95,7 +95,8 @@ def init():
     rnd.seed()
 
     # Default log path is /tmp/{test_name}_log
-    file_name = sys.argv[0].replace('.py','')
+    file_name = os.path.basename(sys.argv[0])
+    file_name = file_name.replace('.py','')
     log_path = '/tmp/' + file_name + '-log'
 
     # Add our own help messages in the usage section
