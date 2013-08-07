@@ -673,7 +673,6 @@ static void cached_fake_complete(struct peerd *peer, struct peer_req *pr)
  *
  */
 
-/* FIXME: rw_range must use the new way of data */
 static int rw_range(struct peerd *peer, struct peer_req *pr, uint32_t op,
 		uint32_t start, uint32_t end)
 {
@@ -739,6 +738,7 @@ static int rw_range(struct peerd *peer, struct peer_req *pr, uint32_t op,
 	}
 
 	/* Submit request */
+	XSEGLOG2(&lc, D, "shit %d", srcport);
 	p = xseg_submit(xseg, req, srcport, X_ALLOC);
 	if (p == NoPort) {
 		XSEGLOG2(&lc, W, "Cannot submit request");
@@ -886,7 +886,13 @@ void flush_work(void *wq, void *arg)
 	XSEGLOG2(&lc, I, "Flushing cache entry %p (h: %lu)", ce, cio->h);
 
 	if (__is_entry_clean(cached, ce)) {
-		cached_complete(peer, pr);
+		/*
+		 * The request may have originated from a copy request which
+		 * can't be completed yet.
+		 */
+		if (!(pr->req && pr->req->op == X_COPY))
+			cached_complete(peer, pr);
+		xwaitq_signal(&ce->pending_waitq);
 		return;
 	}
 
@@ -1140,10 +1146,144 @@ struct xcache_ops c_ops = {
 	.on_node_init = init_node
 };
 
+
+
 static void handle_read(void *q, void *arg);
 static void handle_write(void *q, void *arg);
 static int forward_req(struct peerd *peer, struct peer_req *pr,
 			struct xseg_request *req);
+
+/*
+ * ===== COPY REQUESTS 	======
+ *
+ * When a copy request is accepted, we must guarantee that the data that are
+ * currently stored for this object will be copied too. However, if write
+ * requests for an object come asynchronously with the copy request, we will not
+ * try to include them to the data that will be copied. That's because we expect
+ * that the users that issue the copy request will wait for the crucial data to
+ * be written and then send the copy request.
+ *
+ * Thus, in writethrough mode we can safely forward the request. In writeback
+ * mode though, we must do the following:
+ *
+ * * First, we check if the object exists in cache.
+ *   * If it exists, we check if it has dirty buckets.
+ *     * If it has dirty buckets, we enqueue ourselves to pending waitq, flush
+ *       the buckets, wait for the flush to return and then check the object
+ *       again.
+ *     * Else, we check if the object is currently on flushing mode. If so we do
+ *       the above, minus the flushing.
+ * * In all the other cases and when the flushes stop, we simply forward the
+ *   request to the blocker.
+ */
+
+static void copy_work(void *wq, void *arg);
+
+static void reenter_copy_work(void *q, void *arg)
+{
+	struct peer_req *pr = (struct peer_req *)arg;
+	struct peerd *peer = pr->peer;
+	struct cached *cached = __get_cached(peer);
+	struct cache_io *cio = __get_cache_io(pr);
+	struct ce *ce = xcache_get_entry(cached->cache, cio->h);
+	int r;
+
+	XSEGLOG2(&lc, D, "Started for %p (h: %lu, pr: %p)", ce, cio->h, pr);
+
+	r = xworkq_enqueue(&ce->workq, copy_work, (void *)pr);
+
+	/*
+	 * Calling xworkq_signal here is harmless, since it will fail if we
+	 * already have the lock
+	 */
+	if (r >= 0) {
+		xworkq_signal(&ce->workq);
+	} else {
+		XSEGLOG2(&lc, E, "Failing pr %p", pr);
+		cached_fail(peer, pr);
+	}
+
+	XSEGLOG2(&lc, D, "Finished for %p (h: %lu, pr: %p)", ce, cio->h, pr);
+}
+
+//WORK
+static void copy_work(void *wq, void *arg)
+{
+	struct peer_req *pr = (struct peer_req *)arg;
+	struct xseg_request *req = pr->req;
+	struct peerd *peer = pr->peer;
+	struct cached *cached = __get_cached(peer);
+	struct cache_io *cio = __get_cache_io(pr);
+	struct ce *ce = xcache_get_entry(cached->cache, cio->h);
+
+	XSEGLOG2(&lc, I, "Copying cache entry %p (h: %lu)", ce, cio->h);
+
+	if (__is_entry_clean(cached, ce)) {
+		if (forward_req(peer, pr, req) < 0) {
+			XSEGLOG2(&lc, E, "Couldn't forward request %p "
+				"to blocker", req);
+			cached_fail(peer, pr);
+		}
+		XSEGLOG2(&lc, D, "Copy for cache entry %p (h: %lu) "
+				"has been forwarded to blocker.", ce, cio->h);
+		return;
+	}
+
+	XSEGLOG2(&lc, D, "Entry %p (h: %lu) must be flushed before copying",
+			ce, cio->h);
+
+	flush_work(NULL, pr);
+
+	/*
+	 * Now that the entry has been flushed, enqueue the copy request to the
+	 * pending waitq.
+	 */
+	cio->work.job_fn = reenter_copy_work;
+	cio->work.job = (void *)pr;
+	xwaitq_enqueue(&ce->pending_waitq, &cio->work);
+
+	XSEGLOG2(&lc, D, "Finished for %p (h: %lu, pr: %p)", ce, cio->h, pr);
+}
+
+
+static void handle_copy(struct peerd *peer, struct peer_req *pr)
+{
+	struct cached *cached = __get_cached(peer);
+	struct xseg_request *req = pr->req;
+	struct cache_io *cio = __get_cache_io(pr);
+	xcache_handler h = NoEntry;
+	char name[XSEG_MAX_TARGETLEN + 1];
+	char *copy_target = xseg_get_target(peer->xseg, req);
+	struct xseg_request_copy *xcopy = (struct xseg_request_copy *)
+		xseg_get_data(peer->xseg, req);
+
+	XSEGLOG2(&lc, D, "Started (pr: %p)", pr);
+	XSEGLOG2(&lc, D, "original target: %s, copy target: %s",
+			xcopy->target, copy_target);
+
+	if (cached->write_policy == WRITETHROUGH)
+		goto forward;
+
+	strncpy(name, xcopy->target, xcopy->targetlen);
+	name[xcopy->targetlen] = 0;
+
+	h = xcache_lookup(cached->cache, name);
+	if (__is_handler_valid(h)) {
+		cio->h = h;
+		/* We must check if it is dirty */
+		reenter_copy_work(NULL, (void *)pr);
+		return;
+	}
+
+forward:
+       if (forward_req(peer, pr, pr->req) < 0) {
+                XSEGLOG2(&lc, E, "Couldn't forward request %p "
+                        "to blocker", req);
+		cached_fail(peer, pr);
+        }
+
+	XSEGLOG2(&lc, D, "Finished (pr: %p)", pr);
+}
 
 /*
  * handle_read reads all buckets within a given request's range.
@@ -1510,10 +1650,10 @@ static void handle_readwrite(void *q, void *arg)
 	XSEGLOG2(&lc, D, "Target is %s (pr: %p)", name, pr);
 
 	/*
-	 * TODO: In case our target is in "rm_entries", you must allocate a cache
-	 * node first, find your target entry in "rm_entries" and then free that
-	 * node. If cache is full though, you won't be able to do so and will wait
-	 * for no reason. Make this faster.
+	 * TODO: In case our target is in "rm_entries", you must allocate a
+	 * cache node first, find your target entry in "rm_entries" and then
+	 * free that node. If cache is full though, you won't be able to do so
+	 * and will wait for no reason. Make this faster.
 	 */
 	h = xcache_lookup(cached->cache, name);
 	if (!__is_handler_valid(h)) {
@@ -1677,6 +1817,12 @@ out:
 	if (!cio->pending_reqs) {
 		if (ce->status == CE_INVALIDATED)
 			cached_fake_complete(peer, pr);
+                /*
+                 * FIXME: The following are wrong. We don't have to rely on
+                 * the cio's state to check if we have originated from another
+                 * request. We can just as well check the original req in
+                 * pr->req.
+                 */
 		else if (cio->state == CIO_READING)
 			handle_read((void *)&ce->workq, (void *)pr);
 		else if (cio->state == CIO_WRITING)
@@ -1810,7 +1956,12 @@ out:
 		cached_fail(peer, pr);
 	} else {
 		ce->status = CE_READY;
-		cached_complete(peer, pr);
+		/*
+		 * The request may have originated from a copy request which
+		 * can't be completed yet.
+		 */
+		if (!(pr->req && pr->req->op == X_COPY))
+			cached_complete(peer, pr);
 	}
 
 	xwaitq_signal(&ce->pending_waitq);
@@ -1863,6 +2014,22 @@ out:
 		else if (cio->state == CIO_FAILED)
 			cached_fail(peer, pr);
 	}
+}
+
+static int handle_receive_copy(struct peerd *peer, struct peer_req *pr,
+			struct xseg_request *req)
+{
+	XSEGLOG2(&lc, D, "Started");
+
+	if (req->state == XS_SERVED) {
+		cached_complete(peer, pr);
+		return 0;
+	} else {
+		cached_fail(peer, pr);
+		return -1;
+	}
+
+	XSEGLOG2(&lc, D, "Finished");
 }
 
 static int handle_receive_read(struct peerd *peer, struct peer_req *pr,
@@ -2076,7 +2243,7 @@ static int handle_derailed(struct peerd *peer, struct peer_req *pr,
 			"\tBlocker port is %u while dst port is %u.",
 			cached->bportno, req->dst_portno);
 
-	p = xseg_submit(peer->xseg, req, cached->bportno, X_ALLOC);
+	p = xseg_submit(peer->xseg, req, pr->portno, X_ALLOC);
 	if (p == NoPort) {
 		XSEGLOG2(&lc, W, "Cannot submit request");
 		fail(peer, pr);
@@ -2113,6 +2280,9 @@ static int handle_accept(struct peerd *peer, struct peer_req *pr,
 		case X_WRITE:
 			/* handle_readwrite is purposefully in job format */
 			handle_readwrite(NULL, (void *)pr);
+			break;
+                case X_COPY:
+                        handle_copy(peer, pr);
 			break;
 #if 0
 		/* NOT YET IMPLEMENTED */
@@ -2157,6 +2327,9 @@ static int handle_receive(struct peerd *peer, struct peer_req *pr,
 			break;
 		case X_WRITE:
 			r = handle_receive_write(peer, pr, req);
+			break;
+		case X_COPY:
+			r = handle_receive_copy(peer, pr, req);
 			break;
 #if 0
 		/* NOT YET IMPLEMENTED */
