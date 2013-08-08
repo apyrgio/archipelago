@@ -1208,7 +1208,7 @@ class CachedTest(BlockerTest, XsegTest):
             'log_level': 3,
 	    'cache_size' : '32M',
             'blocker_port' : 0,
-	    #'policy' : 'writeback',
+	    'policy' : 'writeback',
 	    'cache_objects' : 16
             }
 
