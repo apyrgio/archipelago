@@ -323,7 +323,7 @@ static uint32_t free_bucket_range(struct ce *ce,
 			continue;
 
 		data_status = __get_bucket_data_status(b);
-		/* Safe to free buckets are only valid/invalid buckets */
+		/* Safe to free buckets are only valid buckets */
 		if (data_status != VALID) {
 			if (safe_switch)
 				XSEGLOG2(&lc, E, "BUG: Unsafe bucket (%u, %d) "
@@ -336,6 +336,8 @@ static uint32_t free_bucket_range(struct ce *ce,
 		freed++;
 	}
 	xlock_release(&bq->lock);
+
+	XSEGLOG2(&lc, D, "%u buckets have been freed from ce %p", freed, ce);
 
 	return freed;
 }
@@ -738,7 +740,6 @@ static int rw_range(struct peerd *peer, struct peer_req *pr, uint32_t op,
 	}
 
 	/* Submit request */
-	XSEGLOG2(&lc, D, "shit %d", srcport);
 	p = xseg_submit(xseg, req, srcport, X_ALLOC);
 	if (p == NoPort) {
 		XSEGLOG2(&lc, W, "Cannot submit request");
@@ -804,7 +805,6 @@ static void flush_dirty_buckets(struct cached *cached, struct peer_req *pr)
 			}
 			cio->work.job_fn = put_ce;
 			cio->work.job = (void *)pr;
-			ce->status = CE_READY;
 			xwaitq_enqueue(&cached->req_waitq, &cio->work);
 			return;
 		}
@@ -913,7 +913,11 @@ void flush_work(void *wq, void *arg)
 	} else if (cio->pending_reqs) {
 		XSEGLOG2(&lc, D, "Sent %lu flush request(s) to blocker",
 				cio->pending_reqs);
+	} else {
+		ce->status = CE_READY;
 	}
+
+	XSEGLOG2(&lc, I, "Finished for %p (h: %lu)", ce, cio->h);
 }
 
 void force_flush_work(void *wq, void *arg)
@@ -940,10 +944,26 @@ void force_flush_work(void *wq, void *arg)
 		if (r > 0) {
 			xworkq_enqueue(&cached->workq, signal_waitq, bwaitq);
 		}
+		cached_complete(peer, pr);
 		return;
 	}
 
+	XSEGLOG2(&lc, D, "Cache entry %p (h: %lu) is not clean. Flushing...",
+			ce, cio->h);
 	flush_work(wq, arg);
+
+	/*
+	 * In case we had to flush our entry, we will probably be completed
+	 * on complete_writeback. However, the flush may have been a red
+	 * herring (e.g. due to LOADING buckets, so we check if we are in
+	 * flush mode and if not, we complete our actions.
+	 */
+	if (ce->status == CE_READY) {
+		cached_complete(peer, pr);
+		return;
+	}
+
+	XSEGLOG2(&lc, I, "Finished for %p (h: %lu)", ce, cio->h);
 }
 
 void *init_node(void *c, void *xh)
@@ -1335,7 +1355,8 @@ static void handle_read(void *q, void *arg)
 				end_bucket);
 		end_bucket = cached->buckets_per_object;
 	}
-	XSEGLOG2(&lc, D, "Start: %lu, end %lu for ce: %p", start_bucket, end_bucket);
+	XSEGLOG2(&lc, D, "Start: %lu, end %lu for ce: %p",
+			start_bucket, end_bucket, ce);
 
 	/* Issue read requests to blocker for invalid buckets */
 	for (i = start_bucket; i <= end_bucket; i++) {
@@ -1452,6 +1473,9 @@ static void handle_write(void *q, void *arg)
 	start_bucket = __get_bucket(cached, req->offset);
 	end_bucket = __get_bucket(cached, req->offset + req->size - 1);
 
+	XSEGLOG2(&lc, D, "Start: %lu, end %lu for ce: %p",
+			start_bucket, end_bucket, ce);
+
 	/*
 	 * In case of a misaligned write, if the start, end buckets of the write
 	 * are invalid, we have to read them before continuing with the write.
@@ -1558,8 +1582,8 @@ static void reenter_handle_readwrite_claim(void *q, void *arg)
 /*
  * handle_readwrite_claim() tries to claim the necessary object data buckets to
  * complete the request.  If it can't, it enqueues a job to call
- * handle_read_write_claim() when a bucket is available. You can read more in the
- * "Bucket claiming" section.
+ * handle_read_write_claim() when a bucket is available. You can read more in
+ * the "Bucket claiming" section.
  */
 static void handle_readwrite_claim(void *q, void *arg)
 {
@@ -1921,6 +1945,9 @@ static void complete_write_back(struct peerd *peer, struct peer_req *pr,
 	start = __get_bucket(cached, req->offset);
 	end = __get_bucket(cached, req->offset + req->size - 1);
 
+	XSEGLOG2(&lc, D, "Start: %lu, end %lu for ce: %p",
+			start, end, ce);
+
 	for (i = start; i <= end; i++) {
 		b = &ce->buckets[i];
 		if (__get_bucket_data_status(b) == WRITING)
@@ -1938,15 +1965,15 @@ out:
 	 * aggressively
 	 */
 	if (!bucket_pool_not_empty(cached) && waiters_exist(bwaitq)) {
-		r = free_bucket_range(ce, start, end, 1);
+		r = free_bucket_range(ce, start, end, 0);
 		if (r > 0) {
 			xworkq_enqueue(&cached->workq, signal_waitq, bwaitq);
 		}
 	}
 
 	if (cio->pending_reqs){
-		XSEGLOG2(&lc, D, "%lu request(s) remaining for pr %p (ce: %p, h: %lu)",
-				cio->pending_reqs, pr, ce, cio->h);
+		XSEGLOG2(&lc, D, "%lu request(s) remaining for pr %p (ce: %p, "
+				"h: %lu)", cio->pending_reqs, pr, ce, cio->h);
 		return;
 	}
 
@@ -2394,8 +2421,13 @@ static void force_reclaim_buckets(struct cached *cached)
 	if (bac[CLAIMED] > 0) {
 		if (ce->status != CE_FLUSHING && ce->status != CE_DELETING) {
 			XSEGLOG2(&lc, I, "Force flush of LRU object");
-			xworkq_enqueue(&ce->workq, force_flush_work, (void *)&ce->pr);
+			xworkq_enqueue(&ce->workq, force_flush_work,
+					(void *)&ce->pr);
 			xworkq_signal(&ce->workq);
+			/*
+			 * We don't want to put the entry to make sure that
+			 * force_flush_work finds a valid ce
+			 */
 			goto out;
 		}
 	} else {
