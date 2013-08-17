@@ -1473,6 +1473,9 @@ static void handle_write(void *q, void *arg)
 	start_bucket = __get_bucket(cached, req->offset);
 	end_bucket = __get_bucket(cached, req->offset + req->size - 1);
 
+	XSEGLOG2(&lc, D, "Start: %lu, end %lu for ce: %p",
+			start_bucket, end_bucket, ce);
+
 	/*
 	 * In case of a misaligned write, if the start, end buckets of the write
 	 * are invalid, we have to read them before continuing with the write.
@@ -1942,6 +1945,9 @@ static void complete_write_back(struct peerd *peer, struct peer_req *pr,
 	start = __get_bucket(cached, req->offset);
 	end = __get_bucket(cached, req->offset + req->size - 1);
 
+	XSEGLOG2(&lc, D, "Start: %lu, end %lu for ce: %p",
+			start, end, ce);
+
 	for (i = start; i <= end; i++) {
 		b = &ce->buckets[i];
 		if (__get_bucket_data_status(b) == WRITING)
@@ -1959,15 +1965,15 @@ out:
 	 * aggressively
 	 */
 	if (!bucket_pool_not_empty(cached) && waiters_exist(bwaitq)) {
-		r = free_bucket_range(ce, start, end, 1);
+		r = free_bucket_range(ce, start, end, 0);
 		if (r > 0) {
 			xworkq_enqueue(&cached->workq, signal_waitq, bwaitq);
 		}
 	}
 
 	if (cio->pending_reqs){
-		XSEGLOG2(&lc, D, "%lu request(s) remaining for pr %p (ce: %p, h: %lu)",
-				cio->pending_reqs, pr, ce, cio->h);
+		XSEGLOG2(&lc, D, "%lu request(s) remaining for pr %p (ce: %p, "
+				"h: %lu)", cio->pending_reqs, pr, ce, cio->h);
 		return;
 	}
 
