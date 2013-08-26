@@ -134,6 +134,8 @@ struct cached {
 	struct xq bucket_indexes;
 	struct cached_stats stats;
 	//scheduler
+	uint64_t *bucket_alloc_status_counters;
+	uint64_t *bucket_data_status_counters;
 };
 
 struct bucket {

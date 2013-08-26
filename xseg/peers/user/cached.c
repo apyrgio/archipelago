@@ -120,20 +120,36 @@ static inline int __get_bucket_data_status(struct bucket *b)
 static inline void __set_bucket_alloc_status(struct ce *ce,
 		struct bucket *b, int new_status)
 {
+	struct peerd *peer = ce->pr.peer;
+	struct cached *cached = __get_cached(peer);
 	int old_status = __get_bucket_alloc_status(b);
+	uint64_t *gbac = cached->bucket_alloc_status_counters;
 
-	ce->bucket_alloc_status_counters[old_status]--;
+	if (new_status == old_status)
+		return;
+
+	__sync_add_and_fetch(&gbac[new_status], 1);
+	__sync_sub_and_fetch(&gbac[old_status], 1);
 	ce->bucket_alloc_status_counters[new_status]++;
+	ce->bucket_alloc_status_counters[old_status]--;
 	SET_FLAG(BUCKET_ALLOC_STATUS, b->flags, new_status);
 }
 
 static inline void __set_bucket_data_status(struct ce *ce,
 		struct bucket *b, int new_status)
 {
+	struct peerd *peer = ce->pr.peer;
+	struct cached *cached = __get_cached(peer);
 	int old_status = __get_bucket_data_status(b);
+	uint64_t *gbdc = cached->bucket_data_status_counters;
 
-	ce->bucket_data_status_counters[old_status]--;
+	if (new_status == old_status)
+		return;
+
+	__sync_add_and_fetch(&gbdc[new_status], 1);
+	__sync_sub_and_fetch(&gbdc[old_status], 1);
 	ce->bucket_data_status_counters[new_status]++;
+	ce->bucket_data_status_counters[old_status]--;
 	SET_FLAG(BUCKET_DATA_STATUS, b->flags, new_status);
 }
 
@@ -624,7 +640,8 @@ static void cached_fail(struct peerd *peer, struct peer_req *pr)
 	struct cached *cached = __get_cached(peer);
 	struct cache_io *cio = __get_cache_io(pr);
 
-	XSEGLOG2(&lc, I, "Failing pr %p (h: %lu)", pr, cio->h);
+	XSEGLOG2(&lc, E, "Failing pr %p (h: %lu)", pr, cio->h);
+
 	if (__can_respond_request(peer, pr))
 		fail(peer, pr);
 
@@ -1045,18 +1062,11 @@ int on_init(void *c, void *e)
 	ce_cio->state = CIO_ACCEPTED;
 	ce_cio->pending_reqs = 0;
 
-	//__are_buckets_clean(ce);
-
 	/*
-	 * We don't use __set_bucket_*_status_range here, since previous bucket
-	 * statuses will affect our counters
+	 * When a new entry is initialized, it should be already clean.  If
+	 * not, through a warning.
 	 */
-	for (i = 0; i < BUCKET_ALLOC_STATUSES; i++)
-		bac[i] = 0;
-	for (i = 0; i < BUCKET_DATA_STATUSES; i++)
-		bdc[i] = 0;
-	bac[FREE] = cached->buckets_per_object;
-	bdc[INVALID] = cached->buckets_per_object;
+	__are_buckets_clean(ce);
 
 	return 0;
 }
@@ -1726,7 +1736,6 @@ static void handle_readwrite(void *q, void *arg)
 
 	XSEGLOG2(&lc, I, "Target %s is in cache (h: %lu)", name, h);
 
-	/* TODO: Pick a better name */
 	reenter_handle_readwrite_claim(q, arg);
 	XSEGLOG2(&lc, D, "Finished");
 	return;
@@ -2288,7 +2297,7 @@ static int handle_accept(struct peerd *peer, struct peer_req *pr,
 	struct cache_io *cio = __get_cache_io(pr);
 	int r = 0;
 
-	XSEGLOG2(&lc, D, "Started");
+	XSEGLOG2(&lc, D, "Started for pr %p, req %p", pr, req);
 
 	/*
 	 * Handle the scenario where a request has different target port than
@@ -2336,7 +2345,7 @@ static int handle_accept(struct peerd *peer, struct peer_req *pr,
 	}
 
 out:
-	XSEGLOG2(&lc, D, "Finished");
+	XSEGLOG2(&lc, D, "Finished for pr %p, req %p", pr, req);
 	return r;
 }
 
@@ -2346,7 +2355,7 @@ static int handle_receive(struct peerd *peer, struct peer_req *pr,
 	int r = 0;
 	xport p;
 
-	XSEGLOG2(&lc, D, "Handle receive started");
+	XSEGLOG2(&lc, D, "Started for pr %p, req %p", pr, req);
 
 	switch (req->op){
 		case X_READ:
@@ -2371,7 +2380,7 @@ static int handle_receive(struct peerd *peer, struct peer_req *pr,
 			break;
 	}
 
-	XSEGLOG2(&lc, D, "Handle receive ended");
+	XSEGLOG2(&lc, D, "Finished for pr %p, req %p", pr, req);
 	return r;
 }
 
@@ -2513,6 +2522,8 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	char max_req_size[MAX_ARG_LEN + 1];
 	char write_policy[MAX_ARG_LEN + 1];
 	uint64_t total_buckets;
+	uint64_t *bac = NULL;
+	uint64_t *bdc = NULL;
 	long bportno = -1;
 	int r;
 
@@ -2537,6 +2548,14 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	}
 	peer->priv = cached;
 	xlock_release(&cached->stats.lock);
+
+	/* Allocate global bucket status counters */
+	bac = calloc(BUCKET_ALLOC_STATUSES, sizeof(uint64_t));
+ 	cached->bucket_alloc_status_counters = bac;
+	bdc = calloc(BUCKET_DATA_STATUSES, sizeof(uint64_t));
+ 	cached->bucket_data_status_counters = bdc;
+	if (!bac || !bdc)
+		goto cache_fail;
 
 	for (i = 0; i < peer->nr_ops; i++) {
 		struct cache_io *cio = malloc(sizeof(struct cache_io));
@@ -2682,6 +2701,10 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 
 	total_buckets = cached->total_size / cached->bucket_size;
 
+	/* Initialize bucket counters */
+	bac[FREE] = total_buckets;
+	bdc[INVALID] = total_buckets;
+
 	if (!xq_alloc_seq(&cached->bucket_indexes, total_buckets, total_buckets)) {
 		XSEGLOG2(&lc, E, "Cannot create bucket index");
 		return -1;
@@ -2708,6 +2731,8 @@ cio_fail:
 		free(peer->peer_reqs[i].priv);
 	free(cached->cache);
 cache_fail:
+	free(bac);
+	free(bdc);
 	free(cached);
 fail:
 	return -1;
