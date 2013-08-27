@@ -50,6 +50,17 @@
 #include <cached.h>
 
 /*
+ * We can break from the loop only when:
+ * a. We have been asked to terminate
+ * b. All peer requests are freed (however, this is not a sufficient condition
+ *    for the peer requests stored in each ce)
+ * c. There are no buckets that are in dirty, loading or writing state
+ */
+#define CAN_LEAVE(__peer, __gbdc)				\
+	(isTerminate() && all_peer_reqs_free(__peer) &&		\
+	 !__gbdc[DIRTY] && !__gbdc[LOADING] && !__gbdc[WRITING])
+
+/*
  * Helper functions
  */
 
@@ -1047,13 +1058,8 @@ ce_fail:
  */
 int on_init(void *c, void *e)
 {
-	uint32_t i;
-	struct peerd *peer = (struct peerd *)c;
-	struct cached *cached = peer->priv;
 	struct ce *ce = (struct ce *)e;
 	struct cache_io *ce_cio = ce->pr.priv;
-	uint32_t *bac = ce->bucket_alloc_status_counters;
-	uint32_t *bdc = ce->bucket_data_status_counters;
 
 	XSEGLOG2(&lc, I, "Initializing cache entry %p (ce_cio: %p, h: %lu)",
 			ce, ce_cio, ce_cio->h);
@@ -2473,15 +2479,15 @@ static int custom_cached_loop(void *arg)
 	uint64_t loops;
 
 	struct cached *cached = __get_cached(peer);
+	uint64_t *gbdc = cached->bucket_data_status_counters;
 	struct xwaitq *bwaitq = &cached->bucket_waitq;
 
 	XSEGLOG2(&lc, I, "%s has tid %u.\n", id, pid);
 	xseg_init_local_signal(xseg, peer->portno_start);
-	//for (;!(isTerminate() && xq_count(&peer->free_reqs) == peer->nr_ops);) {
 #ifdef GPERF
 	ProfilerStart("/tmp/profile-cached1.prof");
 #endif
-	for (;!(isTerminate() && all_peer_reqs_free(peer));) {
+	while (!CAN_LEAVE(peer, gbdc)) {
 		//Heart of peerd_loop. This loop is common for everyone.
 		for(loops = threshold; loops > 0; loops--) {
 			if (loops == 1)
@@ -2500,6 +2506,15 @@ static int custom_cached_loop(void *arg)
 
 			xworkq_signal(&cached->workq);
 		}
+
+		while (isTerminate() && gbdc[DIRTY]) {
+			if (xcache_evict_lru(cached->cache) != NoEntry)
+				break;
+		}
+
+		/* Add this check here in order not to sleep for no reason */
+		if (CAN_LEAVE(peer, gbdc))
+			break;
 
 		XSEGLOG2(&lc, I, "%s goes to sleep\n", id);
 		xseg_wait_signal(xseg, 10000000UL);
@@ -2740,8 +2755,9 @@ fail:
 
 void custom_peer_finalize(struct peerd *peer)
 {
-	//write dirty objects
-	//or cache_close(cached->cache);
+	struct cached *cached = __get_cached(peer);
+
+	xcache_close(cached->cache);
 	return;
 }
 

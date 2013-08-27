@@ -598,10 +598,8 @@ static xcache_handler __xcache_evict_lru(struct xcache *cache)
 	xcache_handler lru;
 
 	lru = __xcache_lru(cache);
-	if (lru == NoEntry){
-		XSEGLOG("BUG: No lru found");
+	if (lru == NoEntry)
 		return NoEntry;
-	}
 
 	r = __xcache_evict(cache, lru);
 	if (r < 0)
