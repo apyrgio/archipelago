@@ -1240,6 +1240,15 @@ class CachedTest(BlockerTest, XsegTest):
         start_peer(self.realblocker)
         start_peer(self.blocker)
 
+    @staticmethod
+    def get_reply_info(size):
+        xinfo = xseg_reply_info()
+        # In cached, we commonly operate under a 4k granularity
+        if size % 4096:
+            size = (size/4096 + 1)*4096
+        xinfo.size = size
+        return xinfo
+
 
 
 if __name__=='__main__':
