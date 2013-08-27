@@ -1312,11 +1312,46 @@ static void handle_copy(struct peerd *peer, struct peer_req *pr)
 	}
 
 forward:
-       if (forward_req(peer, pr, pr->req) < 0) {
-                XSEGLOG2(&lc, E, "Couldn't forward request %p "
-                        "to blocker", req);
+	if (forward_req(peer, pr, pr->req) < 0) {
+		XSEGLOG2(&lc, E, "Couldn't forward request %p "
+			"to blocker", req);
 		cached_fail(peer, pr);
-        }
+	}
+
+	XSEGLOG2(&lc, D, "Finished (pr: %p)", pr);
+}
+
+static void handle_info(struct peerd *peer, struct peer_req *pr)
+{
+	struct cached *cached = __get_cached(peer);
+	struct xseg_request *req = pr->req;
+	struct cache_io *cio = __get_cache_io(pr);
+	xcache_handler h = NoEntry;
+	char name[XSEG_MAX_TARGETLEN + 1];
+	char *target;
+
+	XSEGLOG2(&lc, D, "Started (pr: %p)", pr);
+
+	if (cached->write_policy == WRITETHROUGH)
+		goto forward;
+
+	target = xseg_get_target(peer->xseg, req);
+	strncpy(name, target, req->targetlen);
+	name[req->targetlen] = 0;
+
+	XSEGLOG2(&lc, D, "Getting info for target %s (pr: %p)", name, pr);
+
+	h = xcache_lookup(cached->cache, name);
+	if (__is_handler_valid(h))
+		cio->h = h;
+
+forward:
+	/* Info request must be forwarded to blocker first */
+	if (forward_req(peer, pr, pr->req) < 0) {
+		XSEGLOG2(&lc, E, "Couldn't forward request %p "
+				"to blocker", req);
+		cached_fail(peer, pr);
+	}
 
 	XSEGLOG2(&lc, D, "Finished (pr: %p)", pr);
 }
@@ -2074,6 +2109,82 @@ static int handle_receive_copy(struct peerd *peer, struct peer_req *pr,
 	XSEGLOG2(&lc, D, "Finished");
 }
 
+static int handle_receive_info(struct peerd *peer, struct peer_req *pr,
+			struct xseg_request *req)
+{
+	struct cached *cached = __get_cached(peer);
+	struct xseg_reply_info *xinfo;
+	struct cache_io *cio = __get_cache_io(pr);
+	struct ce *ce;
+	struct bucket *b;
+	char *req_data;
+	uint32_t start, end, i;
+	int alloc_status, data_status;
+
+	XSEGLOG2(&lc, D, "Started (pr: %p)", pr);
+
+	/*
+	 * In writethrough mode, we always trust the blocker. Also, if there is
+	 * no cache entry with that name, we trust the blocker too,
+	 * regardless of operation mode
+	 */
+	if (cached->write_policy == WRITETHROUGH ||
+		!__is_handler_valid(cio->h)) {
+
+		if (req->state == XS_SERVED) {
+			cached_complete(peer, pr);
+			return 0;
+		} else {
+			cached_fail(peer, pr);
+			return -1;
+		}
+	}
+
+	req_data = xseg_get_data(peer->xseg, req);
+	xinfo = (struct xseg_reply_info *)req_data;
+
+	/*
+	 * Blocker returns fail if no such object exists. In this case, it
+	 * only exists in cached so we can continue.
+	 */
+	if (req->state & XS_FAILED) {
+		req->state &= ~XS_FAILED;
+		xinfo->size = 0;
+	}
+
+	ce = (struct ce *)xcache_get_entry(cached->cache, cio->h);
+	if (!ce) {
+		XSEGLOG2(&lc, E, "Received cache entry handler %lu but no "
+				"cache entry", cio->h);
+		cached_fail(peer, pr);
+	}
+
+	start = __get_bucket(cached, xinfo->size);
+	end = cached->buckets_per_object - 1;
+
+	/* Check which is the last written bucket */
+	for (i = start; i <= end; i++) {
+		b = &ce->buckets[i];
+		alloc_status = __get_bucket_alloc_status(b);
+
+		if (alloc_status == FREE)
+			continue;
+
+		data_status = __get_bucket_data_status(b);
+
+		if (data_status == WRITING || data_status == DIRTY)
+			xinfo->size = cached->bucket_size * (i + 1);
+		else if (data_status == VALID)
+			XSEGLOG2(&lc, W, "BUG: Valid bucket %d doesn't "
+					"exist in blocker", i);
+	}
+	cached_complete(peer, pr);
+
+	XSEGLOG2(&lc, D, "Finished (pr: %p)", pr);
+
+	return 0;
+}
+
 static int handle_receive_read(struct peerd *peer, struct peer_req *pr,
 			struct xseg_request *req)
 {
@@ -2326,6 +2437,9 @@ static int handle_accept(struct peerd *peer, struct peer_req *pr,
                 case X_COPY:
                         handle_copy(peer, pr);
 			break;
+                case X_INFO:
+                        handle_info(peer, pr);
+			break;
 #if 0
 		/* NOT YET IMPLEMENTED */
 		case X_DELETE:
@@ -2372,6 +2486,9 @@ static int handle_receive(struct peerd *peer, struct peer_req *pr,
 			break;
 		case X_COPY:
 			r = handle_receive_copy(peer, pr, req);
+			break;
+		case X_INFO:
+			r = handle_receive_info(peer, pr, req);
 			break;
 #if 0
 		/* NOT YET IMPLEMENTED */
