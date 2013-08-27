@@ -189,9 +189,9 @@ static inline int __is_bucket_claimed(struct bucket *b)
 	return __get_bucket_alloc_status(b) == CLAIMED;
 }
 
-static uint32_t __get_bucket(struct cached *cache, uint64_t offset)
+static uint32_t __get_bucket(struct cached *cached, uint64_t offset)
 {
-	return (offset / cache->bucket_size);
+	return (offset / cached->bucket_size);
 }
 
 static uint32_t __get_last_per_status(struct ce *ce, uint32_t start,
@@ -2537,8 +2537,8 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	char max_req_size[MAX_ARG_LEN + 1];
 	char write_policy[MAX_ARG_LEN + 1];
 	uint64_t total_buckets;
-	uint64_t *bac = NULL;
-	uint64_t *bdc = NULL;
+	uint64_t *gbac = NULL;
+	uint64_t *gbdc = NULL;
 	long bportno = -1;
 	int r;
 
@@ -2565,11 +2565,11 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	xlock_release(&cached->stats.lock);
 
 	/* Allocate global bucket status counters */
-	bac = calloc(BUCKET_ALLOC_STATUSES, sizeof(uint64_t));
- 	cached->bucket_alloc_status_counters = bac;
-	bdc = calloc(BUCKET_DATA_STATUSES, sizeof(uint64_t));
- 	cached->bucket_data_status_counters = bdc;
-	if (!bac || !bdc)
+	gbac = calloc(BUCKET_ALLOC_STATUSES, sizeof(uint64_t));
+	cached->bucket_alloc_status_counters = gbac;
+	gbdc = calloc(BUCKET_DATA_STATUSES, sizeof(uint64_t));
+	cached->bucket_data_status_counters = gbdc;
+	if (!gbac || !gbdc)
 		goto cache_fail;
 
 	for (i = 0; i < peer->nr_ops; i++) {
@@ -2717,8 +2717,8 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	total_buckets = cached->total_size / cached->bucket_size;
 
 	/* Initialize bucket counters */
-	bac[FREE] = total_buckets;
-	bdc[INVALID] = total_buckets;
+	gbac[FREE] = total_buckets;
+	gbdc[INVALID] = total_buckets;
 
 	if (!xq_alloc_seq(&cached->bucket_indexes, total_buckets, total_buckets)) {
 		XSEGLOG2(&lc, E, "Cannot create bucket index");
@@ -2746,8 +2746,8 @@ cio_fail:
 		free(peer->peer_reqs[i].priv);
 	free(cached->cache);
 cache_fail:
-	free(bac);
-	free(bdc);
+	free(gbac);
+	free(gbdc);
 	free(cached);
 fail:
 	return -1;
