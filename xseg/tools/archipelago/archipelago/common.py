@@ -580,7 +580,7 @@ def check_conf():
             peers[role] = Vlmcd(role=role, spec=segment.get_spec(),
                                 **role_config)
         elif role_type == 'cached':
-            peers[role] = Cached(role=role, spec=config['SPEC'].encode(),
+            peers[role] = Cached(role=role, spec=segment.get_spec(),
                                  **role_config)
         else:
             raise Error("No valid peer type: %s" % role_type)
