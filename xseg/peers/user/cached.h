@@ -117,11 +117,6 @@ struct cache_io {
 	struct work work;
 };
 
-struct cached_stats {
-	struct xlock lock;
-	volatile uint64_t evicted;
-};
-
 struct cached {
 	struct xcache *cache;
 	uint64_t total_size; /* Total cache size (bytes) */
@@ -130,18 +125,21 @@ struct cached {
 	uint32_t object_size; /* Max object size (bytes) */
 	uint32_t bucket_size; /* Bucket size (bytes) */
 	uint32_t buckets_per_object; /* Max buckets per object (plain) */
+	uint64_t total_buckets;	/* Total number of buckets */
 	xport bportno;
 	int write_policy;
 	struct xworkq workq;
+	struct xworkq bucket_workq;
 	struct xwaitq pending_waitq;
 	struct xwaitq bucket_waitq;
 	struct xwaitq req_waitq;
 	unsigned char *bucket_data;
 	struct xq bucket_indexes;
-	struct cached_stats stats;
+	struct xlock bucket_lock;
 	//scheduler
 	uint64_t *bucket_alloc_status_counters;
 	uint64_t *bucket_data_status_counters;
+	double threshold;
 };
 
 struct bucket {

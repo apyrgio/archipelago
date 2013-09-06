@@ -495,6 +495,17 @@ static int can_send_to_blocker(void *arg)
 	return (ce->status != CE_FLUSHING && ce->status != CE_DELETING);
 }
 
+static int __check_threshold(struct cached *cached)
+{
+	volatile uint64_t *gbdc = cached->bucket_data_status_counters;
+
+	if ((double)gbdc[DIRTY] / cached->total_buckets > cached->threshold) {
+		return 1;
+	}
+
+	return 0;
+}
+
 __attribute__ ((unused))
 static void __print_bc(uint32_t *bc) {
 	XSEGLOG("Bucket statuses:\n"
@@ -871,7 +882,6 @@ static void flush_dirty_buckets(struct cached *cached, struct peer_req *pr)
 			xworkq_enqueue(&cached->workq, signal_waitq, bwaitq);
 		}
 	}
-
 }
 
 /*
@@ -988,6 +998,7 @@ void force_flush_work(void *wq, void *arg)
 		return;
 	}
 
+	/* FIXME: Free buckets only when we are really out of space */
 	if (__is_entry_clean(cached, ce)) {
 		r = free_bucket_range(ce, 0, cached->buckets_per_object - 1, 1);
 		if (r > 0) {
@@ -1102,22 +1113,16 @@ void on_reinsert(void *c, void *e)
 {
 	struct ce *ce = (struct ce *)e;
 	struct cache_io *ce_cio = ce->pr.priv;
-	struct peerd *peer = ce->pr.peer;
-	struct cached *cached = __get_cached(peer);
 
 	XSEGLOG2(&lc, I, "Re-inserted cache entry %p (h: %lu)", ce, ce_cio->h);
-	__sync_sub_and_fetch(&cached->stats.evicted, 1);
 }
 
 int on_evict(void *c, void *e)
 {
 	struct ce *ce = (struct ce *)e;
 	struct cache_io *ce_cio = ce->pr.priv;
-	struct peerd *peer = ce->pr.peer;
-	struct cached *cached = __get_cached(peer);
 
 	XSEGLOG2(&lc, I, "Evicted cache entry %p (h: %lu)", ce, ce_cio->h);
-	__sync_add_and_fetch(&cached->stats.evicted, 1);
 	return 0;
 }
 
@@ -1153,8 +1158,6 @@ void on_put(void *c, void *e)
 
 	XSEGLOG2(&lc, I, "Puting cache entry %p (ce_cio: %p, h: %lu)",
 			ce, ce_cio, ce_cio->h);
-
-	__sync_sub_and_fetch(&cached->stats.evicted, 1);
 
 	if (waiters_exist(&ce->pending_waitq))
 		XSEGLOG2(&lc, W, "BUG: There are waiters in pending waitq!");
@@ -1441,10 +1444,12 @@ static void handle_read(void *q, void *arg)
 		if (status == INVALID) {
 			XSEGLOG2(&lc, D, "Found invalid bucket %lu", i);
 			first_invalid = i;
-			last_invalid = __get_last_invalid(ce, first_invalid, end_bucket);
+			last_invalid = __get_last_invalid(ce, first_invalid,
+					end_bucket);
 			i = last_invalid;
 
-			if (rw_range(peer, pr, X_READ, first_invalid, last_invalid) < 0) {
+			if (rw_range(peer, pr, X_READ, first_invalid,
+						last_invalid) < 0) {
 				cio->state = CIO_FAILED;
 				break;
 			}
@@ -1556,7 +1561,7 @@ static void handle_write(void *q, void *arg)
 	b = &ce->buckets[start_bucket];
 	start_bucket_status = __get_bucket_data_status(b);
 	if (start_bucket_status == INVALID && first_bucket_offset) {
-		XSEGLOG2(&lc, W, "Misalligned write for %p (h: %lu, pr: %p)",
+		XSEGLOG2(&lc, I, "Misalligned write for %p (h: %lu, pr: %p)",
 				ce, cio->h, pr);
 		if (rw_range(peer, pr, X_READ, start_bucket, start_bucket) < 0) {
 			cio->state = CIO_FAILED;
@@ -1571,7 +1576,7 @@ static void handle_write(void *q, void *arg)
 	b = &ce->buckets[end_bucket];
 	end_bucket_status = __get_bucket_data_status(b);
 	if (end_bucket_status == INVALID && last_bucket_offset) {
-		XSEGLOG2(&lc, W, "Misalligned write for %p (h: %lu, pr: %p)",
+		XSEGLOG2(&lc, I, "Misalligned write for %p (h: %lu, pr: %p)",
 				ce, cio->h, pr);
 		if (rw_range(peer, pr, X_READ, end_bucket, end_bucket) < 0) {
 			cio->state = CIO_FAILED;
@@ -2547,20 +2552,19 @@ int dispatch(struct peerd *peer, struct peer_req *pr, struct xseg_request *req,
 	return 0;
 }
 
-static void force_reclaim_buckets(struct cached *cached)
+void force_reclaim_buckets(void *wq, void *arg)
 {
+	struct cached *cached = arg;
 	struct ce *ce;
 	uint32_t *bac;
 	xcache_handler lru;
-
-
-	if (!xlock_try_lock(&cached->stats.lock, 4))
-		return;
+	//volatile uint64_t *gbdc = cached->bucket_data_status_counters;
 
 	XSEGLOG2(&lc, D, "Started");
 
-	if (cached->stats.evicted)
-		goto out;
+	if (!__check_threshold(cached) && bucket_pool_not_empty(cached)) {
+		return;
+	}
 
 	lru = xcache_peek_and_get_lru(cached->cache);
 	if (lru == NoEntry)
@@ -2569,6 +2573,7 @@ static void force_reclaim_buckets(struct cached *cached)
 	ce = xcache_get_entry(cached->cache, lru);
 	if (!ce)
 		goto out;
+
 	XSEGLOG2(&lc, D, "LRU is %lu", lru);
 
 	bac = ce->bucket_alloc_status_counters;
@@ -2591,8 +2596,6 @@ static void force_reclaim_buckets(struct cached *cached)
 	xcache_put(cached->cache, lru);
 
 out:
-	xlock_release(&cached->stats.lock);
-
 	XSEGLOG2(&lc, D, "Finished");
 }
 
@@ -2618,8 +2621,7 @@ static int custom_cached_loop(void *arg)
 	uint64_t loops;
 
 	struct cached *cached = __get_cached(peer);
-	uint64_t *gbdc = cached->bucket_data_status_counters;
-	struct xwaitq *bwaitq = &cached->bucket_waitq;
+	volatile uint64_t *gbdc = cached->bucket_data_status_counters;
 
 	XSEGLOG2(&lc, I, "%s has tid %u.\n", id, pid);
 	xseg_init_local_signal(xseg, peer->portno_start);
@@ -2638,12 +2640,24 @@ static int custom_cached_loop(void *arg)
 #endif
 				loops = threshold;
 
-			if (!bucket_pool_not_empty(cached) &&
-					waiters_exist(bwaitq) &&
-					!cached->stats.evicted)
-				force_reclaim_buckets(cached);
-
+			if (!bucket_pool_not_empty(cached)) {
+				XSEGLOG2(&lc, D, "Out of buckets.");
+				xworkq_enqueue(&cached->bucket_workq,
+						force_reclaim_buckets,
+						cached);
+				xworkq_signal(&cached->bucket_workq);
+			}
 			xworkq_signal(&cached->workq);
+		}
+
+		if (__check_threshold(cached)) {
+			XSEGLOG2(&lc, D, "Over threshold.");
+			xworkq_enqueue(&cached->bucket_workq,
+					force_reclaim_buckets,
+					cached);
+			xworkq_signal(&cached->bucket_workq);
+			xworkq_signal(&cached->workq);
+
 		}
 
 		while (isTerminate() && gbdc[DIRTY]) {
@@ -2675,7 +2689,6 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	char object_size[MAX_ARG_LEN + 1];
 	char max_req_size[MAX_ARG_LEN + 1];
 	char write_policy[MAX_ARG_LEN + 1];
-	uint64_t total_buckets;
 	uint64_t *gbac = NULL;
 	uint64_t *gbdc = NULL;
 	long bportno = -1;
@@ -2701,8 +2714,9 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 		goto cache_fail;
 	}
 	peer->priv = cached;
-	xlock_release(&cached->stats.lock);
 
+	xlock_release(&cached->bucket_lock);
+	cached->threshold = 0.75;
 	/* Allocate global bucket status counters */
 	gbac = calloc(BUCKET_ALLOC_STATUSES, sizeof(uint64_t));
 	cached->bucket_alloc_status_counters = gbac;
@@ -2853,22 +2867,27 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	/* Touch the malloced space to be fast even for cold cache */
 	memset(cached->bucket_data, 0, cached->total_size);
 
-	total_buckets = cached->total_size / cached->bucket_size;
+	cached->total_buckets = cached->total_size / cached->bucket_size;
 
 	/* Initialize bucket counters */
-	gbac[FREE] = total_buckets;
-	gbdc[INVALID] = total_buckets;
+	gbac[FREE] = cached->total_buckets;
+	gbdc[INVALID] = cached->total_buckets;
 
-	if (!xq_alloc_seq(&cached->bucket_indexes, total_buckets, total_buckets)) {
+	if (!xq_alloc_seq(&cached->bucket_indexes, cached->total_buckets,
+				cached->total_buckets)) {
 		XSEGLOG2(&lc, E, "Cannot create bucket index");
 		return -1;
 	}
 
 	/* Initialize workqs/waitqs */
 	xworkq_init(&cached->workq, NULL, 0);
-	xwaitq_init(&cached->pending_waitq, cache_not_full, cached, 0);
-	xwaitq_init(&cached->bucket_waitq, bucket_pool_not_empty, cached, 0);
-	xwaitq_init(&cached->req_waitq, req_pool_not_empty, peer, 0);
+	xworkq_init(&cached->bucket_workq, &cached->bucket_lock, 0);
+	xwaitq_init(&cached->pending_waitq, cache_not_full,
+			cached, XWAIT_SIGNAL_ONE);
+	xwaitq_init(&cached->bucket_waitq, bucket_pool_not_empty,
+			cached, XWAIT_SIGNAL_ONE);
+	xwaitq_init(&cached->req_waitq, req_pool_not_empty,
+			peer, XWAIT_SIGNAL_ONE);
 
 	xseg_set_max_requests(peer->xseg, peer->portno_start, 10000);
 	xseg_set_freequeue_size(peer->xseg, peer->portno_start, 10000, 0);
