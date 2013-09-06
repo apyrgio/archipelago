@@ -80,6 +80,12 @@
 #define WRITETHROUGH 1
 #define WRITEBACK    2
 
+/* ce/bucket memcpy operations */
+#define TO_CE 0
+#define FROM_CE 1
+#define TO_BUCKET TO_CE
+#define FROM_BUCKET FROM_CE
+
 #define WRITE_POLICY(__wcp)				\
 	(__wcp == WRITETHROUGH	? "writethrough" :	\
 	__wcp == WRITEBACK	? "writeback"	 :	\

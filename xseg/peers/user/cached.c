@@ -368,19 +368,27 @@ static uint32_t free_bucket_range(struct ce *ce,
 
 	return freed;
 }
-
-static void rw_bucket(struct bucket *b, int op, unsigned char *data,
-		uint64_t offset, uint64_t size)
+/*
+ * ce_memcpy()'s fields are the following:
+ * a. op: The operation mode. That is, copy TO_BUCKET or copy FROM_BUCKET.
+ * b. b: The bucket where the io takes place.
+ * c. bucket_offset: The offset in the bucket where we will copy data from/to
+ * d. req_data: The pointer to the buffer of the xseg_request
+ * e. data_size: The size of the data
+ */
+static void bucket_memcpy(int op, struct bucket *b, uint64_t bucket_offset,
+		unsigned char *req_data, uint64_t data_size)
 {
 	unsigned char *to = NULL;
 	unsigned char *from = NULL;
+	unsigned char *bucket_data = b->data + bucket_offset;
 
-	if (op == X_WRITE) {
-		to = b->data + offset;
-		from = data;
-	} else if (op == X_READ) {
-		to = data;
-		from = b->data + offset;
+	if (op == TO_BUCKET) {
+		to = bucket_data;
+		from = req_data;
+	} else if (op == FROM_BUCKET) {
+		to = req_data;
+		from = bucket_data;
 	}
 
 	if (!to || !from) {
@@ -388,42 +396,55 @@ static void rw_bucket(struct bucket *b, int op, unsigned char *data,
 		return;
 	}
 
-	memcpy(to, from, size);
+	memcpy(to, from, data_size);
 }
 
-static void rw_bucket_range(struct ce *ce, int op, unsigned char *data,
-		uint64_t offset, uint64_t size)
+/*
+ * ce_memcpy()'s fields are the following:
+ * a. op: The operation mode. That is, copy TO_CE or copy FROM_CE.
+ * b. ce: The cache entry where the io takes place.
+ * c. ce_offset: The offset in the cache entry where we will copy data from/to
+ * d. req_data: The pointer to the buffer of the xseg_request
+ * e. data_size: The size of the data
+ */
+static void ce_memcpy(int op, struct ce *ce, uint64_t ce_offset,
+		unsigned char *req_data, uint64_t data_size)
 {
 	struct peerd *peer = ce->pr.peer;
 	struct cached *cached = __get_cached(peer);
 	struct bucket *b;
 	uint32_t start_bucket, end_bucket;
-	uint64_t bucket_offset, data_size;
+	uint64_t bucket_offset, bucket_size;
 	uint32_t i;
 
-	start_bucket = __get_bucket(cached, offset);
-	end_bucket = __get_bucket(cached, offset + size - 1);
+	start_bucket = __get_bucket(cached, ce_offset);
+	end_bucket = __get_bucket(cached, ce_offset + data_size - 1);
+
+	/*
+	 * Logic dictates that only the fist time can the bucket offset be != 0
+	 */
+	bucket_offset = ce_offset % cached->bucket_size;
 
 	for (i = start_bucket; i <= end_bucket; i++) {
 		b = &ce->buckets[i];
+
 		/*
-		 * 1. Calculate offset inside bucket
-		 * 2. Do not write more than bucket size (data_size)
+		 * If the request size is larger than the bucket size, write
+		 * enough to fill the bucket and continue with the next one
 		 */
-		bucket_offset = offset % cached->bucket_size;
-		data_size = bucket_offset + size < cached->bucket_size ?
-			size : cached->bucket_size - bucket_offset;
+		if (bucket_offset + data_size < cached->bucket_size)
+			bucket_size = data_size;
+		else
+			bucket_size = cached->bucket_size - bucket_offset;
 
-		rw_bucket(b, op, data, bucket_offset, data_size);
+		bucket_memcpy(op, b, bucket_offset, req_data, bucket_size);
 
-		if (op == X_READ)
-			data += data_size;
-
-		size -= data_size;
-		offset += bucket_offset;
+		req_data += bucket_size;
+		data_size -= bucket_size;
+		bucket_offset = 0;
 	}
 
-	if (size > 0)
+	if (data_size > 0)
 		XSEGLOG2(&lc, E, "Read/write error");
 }
 
@@ -634,7 +655,7 @@ static int serve_req(struct peerd *peer, struct peer_req *pr)
 
 	//assert req->serviced <= req->datalen
 	//memcpy(req_data, ce->data + req->offset, req->serviced);
-	rw_bucket_range(ce, X_READ, req_data, req->offset, req->size);
+	ce_memcpy(FROM_CE, ce, req->offset, req_data, req->size);
 	XSEGLOG2(&lc, D, "Finished");
 
 	return 0;
@@ -757,7 +778,7 @@ static int rw_range(struct peerd *peer, struct peer_req *pr, uint32_t op,
 	if (req->op == X_WRITE) {
 		 req_data = (unsigned char *)xseg_get_data(xseg, req);
 		 /* Read from buket into the request buffer */
-		 rw_bucket_range(ce, X_READ, req_data, req->offset, req->size);
+		 ce_memcpy(FROM_CE, ce, req->offset, req_data, req->size);
 	}
 
 	/* Set request data */
@@ -1572,13 +1593,14 @@ static void handle_write(void *q, void *arg)
 
 	if (cached->write_policy == WRITETHROUGH) {
 		if (forward_req(peer, pr, pr->req) < 0) {
-			XSEGLOG2(&lc, E, "Couldn't forward write request %p to blocker", req);
+			XSEGLOG2(&lc, E, "Couldn't forward write request %p "
+					"to blocker", req);
 			cio->state = CIO_FAILED;
 			goto out;
 		}
 		cio->pending_reqs++;
 	} else if (cached->write_policy == WRITEBACK) {
-		rw_bucket_range(ce, X_WRITE, req_data, req->offset, req->size);
+		ce_memcpy(TO_CE, ce, req->offset, req_data, req->size);
 		__set_bucket_data_status_range(ce, start_bucket, end_bucket, DIRTY);
 		req->state |= XS_SERVED;
 		req->serviced = req->size;
@@ -1867,7 +1889,7 @@ static void complete_read(void *q, void *arg)
 		XSEGLOG2(&lc, D, "Bucket %lu loading and reception successful", i);
 		b = &ce->buckets[i];
 
-		rw_bucket(b, X_WRITE, req_data, 0, cached->bucket_size);
+		bucket_memcpy(TO_BUCKET, b, 0, req_data, cached->bucket_size);
 
 		req_data += cached->bucket_size;
 		__set_bucket_data_status(ce, b, VALID);
@@ -1943,7 +1965,7 @@ static void complete_write_through(struct peerd *peer, struct peer_req *pr,
 	if (req->serviced) {
 		start = __get_bucket(cached, req->offset);
 		//memcpy(ce->data + req->offset, req_data, req->serviced);
-		rw_bucket_range(ce, X_WRITE, req_data, req->offset, req->size);
+		ce_memcpy(TO_CE, ce, req->offset, req_data, req->size);
 		end_serviced = __get_bucket(cached, req->offset + req->serviced - 1);
 		__set_bucket_data_status_range(ce, start, end_serviced, VALID);
 	}
