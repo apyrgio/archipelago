@@ -107,6 +107,11 @@ static int waiters_exist(struct xwaitq *wq)
 	return __count_queue_size(wq->q) > 0;
 }
 
+static int workers_exist(struct xworkq *wq)
+{
+	return __count_queue_size(wq->q) > 0;
+}
+
 /*
  * Signal a waitq.
  */
@@ -498,6 +503,10 @@ static int can_send_to_blocker(void *arg)
 static int __check_threshold(struct cached *cached)
 {
 	volatile uint64_t *gbdc = cached->bucket_data_status_counters;
+
+	if (!cached->threshold) {
+		return 0;
+	}
 
 	if ((double)gbdc[DIRTY] / cached->total_buckets > cached->threshold) {
 		return 1;
@@ -2622,6 +2631,7 @@ static int custom_cached_loop(void *arg)
 
 	struct cached *cached = __get_cached(peer);
 	volatile uint64_t *gbdc = cached->bucket_data_status_counters;
+	struct xworkq *bworkq = &cached->bucket_workq;
 
 	XSEGLOG2(&lc, I, "%s has tid %u.\n", id, pid);
 	xseg_init_local_signal(xseg, peer->portno_start);
@@ -2629,10 +2639,17 @@ static int custom_cached_loop(void *arg)
 	ProfilerStart("/tmp/profile-cached1.prof");
 #endif
 	while (!CAN_LEAVE(peer, gbdc)) {
+
+		while (isTerminate() && gbdc[DIRTY]) {
+			if (xcache_evict_lru(cached->cache) != NoEntry)
+				break;
+		}
+
 		//Heart of peerd_loop. This loop is common for everyone.
 		for(loops = threshold; loops > 0; loops--) {
 			if (loops == 1)
 				xseg_prepare_wait(xseg, peer->portno_start);
+
 #ifdef MT
 			if (check_ports(peer, t))
 #else
@@ -2640,29 +2657,23 @@ static int custom_cached_loop(void *arg)
 #endif
 				loops = threshold;
 
-			if (!bucket_pool_not_empty(cached)) {
+			if (!bucket_pool_not_empty(cached) &&
+					!workers_exist(bworkq) &&
+					!gbdc[WRITING]) {
 				XSEGLOG2(&lc, D, "Out of buckets.");
-				xworkq_enqueue(&cached->bucket_workq,
-						force_reclaim_buckets,
-						cached);
-				xworkq_signal(&cached->bucket_workq);
+				xworkq_enqueue(bworkq,
+					force_reclaim_buckets, cached);
+				xworkq_signal(bworkq);
 			}
 			xworkq_signal(&cached->workq);
 		}
 
-		if (__check_threshold(cached)) {
+		if (__check_threshold(cached) &&
+				!workers_exist(bworkq)) {
 			XSEGLOG2(&lc, D, "Over threshold.");
-			xworkq_enqueue(&cached->bucket_workq,
-					force_reclaim_buckets,
-					cached);
-			xworkq_signal(&cached->bucket_workq);
+			xworkq_enqueue(bworkq, force_reclaim_buckets, cached);
+			xworkq_signal(bworkq);
 			xworkq_signal(&cached->workq);
-
-		}
-
-		while (isTerminate() && gbdc[DIRTY]) {
-			if (xcache_evict_lru(cached->cache) != NoEntry)
-				break;
 		}
 
 		/* Add this check here in order not to sleep for no reason */
@@ -2692,6 +2703,7 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	uint64_t *gbac = NULL;
 	uint64_t *gbdc = NULL;
 	long bportno = -1;
+	long dirty_threshold = 75;
 	int r;
 
 	total_size[0] = 0;
@@ -2716,7 +2728,7 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	peer->priv = cached;
 
 	xlock_release(&cached->bucket_lock);
-	cached->threshold = 0.75;
+
 	/* Allocate global bucket status counters */
 	gbac = calloc(BUCKET_ALLOC_STATUSES, sizeof(uint64_t));
 	cached->bucket_alloc_status_counters = gbac;
@@ -2744,6 +2756,7 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	READ_ARG_STRING("-os", object_size, MAX_ARG_LEN);
 	READ_ARG_STRING("-bs", bucket_size, MAX_ARG_LEN);
 	READ_ARG_ULONG("-bp", bportno);
+	READ_ARG_ULONG("--dirty_threshold", dirty_threshold);
 	READ_ARG_STRING("-wcp", write_policy, MAX_ARG_LEN);
 	END_READ_ARGS();
 
@@ -2828,6 +2841,14 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	}
 	cached->bportno = bportno;
 	peer->defer_portno = bportno;
+
+	/* Dirty bucket threshold */
+
+	if (dirty_threshold < 0 || dirty_threshold > 100) {
+		XSEGLOG2(&lc, E, "Threshold is out of limits");
+		goto arg_fail;
+	}
+	cached->threshold = (double)dirty_threshold / 100;
 
 	/* Write policy */
 	if (!write_policy[0]) {
@@ -2915,6 +2936,7 @@ void custom_peer_finalize(struct peerd *peer)
 {
 	struct cached *cached = __get_cached(peer);
 
+	XSEGLOG2(&lc, I, "Cached is finalizing");
 	xcache_close(cached->cache);
 	return;
 }
@@ -2929,6 +2951,8 @@ void custom_peer_usage()
 			"    -bs       | 4KiB          | Bucket size\n"
 			"    -mrs      | 512KiB        | Max request size\n"
 			"    -bp       | None          | Blocker port\n"
-			"    -wcp      | writethrough  | Write policy [writethrough|writeback]\n"
-			"\n");
+			"    -wcp      | writethrough  | Write policy\n"
+			"              |               |     [writethrough|writeback]\n"
+			"    --dirty_  | 75%%         | Acceptable percent of\n"
+			"    threshold |               |     dirty buckets\n");
 }
