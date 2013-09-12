@@ -2934,12 +2934,22 @@ fail:
 	return -1;
 }
 
+int mccloud = 0;
 void custom_peer_finalize(struct peerd *peer)
 {
 	struct cached *cached = __get_cached(peer);
+	int r;
+
+	r = __sync_add_and_fetch(&mccloud, 1);
+
+	/* There can be only one that runs the following segment */
+	if (r > 1)
+		return;
 
 	XSEGLOG2(&lc, I, "Cached is finalizing");
+
 	xcache_close(cached->cache);
+	xcache_free(cached->cache);
 	return;
 }
 
