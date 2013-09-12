@@ -56,6 +56,7 @@ typedef xqindex xcache_handler;
 
 #define NODE_ACTIVE 0
 #define NODE_EVICTED 1
+#define NODE_INVALIDATED 2
 
 /*
  * Called with out cache lock held:

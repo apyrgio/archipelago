@@ -479,7 +479,8 @@ static void xcache_entry_put(struct xcache *cache, xqindex idx)
 
 		if (ce->ref > 0 || ce->parallel_puts > 1)
 			goto out;
-		if (__xcache_remove_rm(cache, idx) < 0)
+		if (ce->state != NODE_INVALIDATED &&
+				__xcache_remove_rm(cache, idx) < 0)
 			goto out;
 
 		ce->parallel_puts--;
@@ -994,11 +995,16 @@ int xcache_invalidate(struct xcache *cache, char *name)
 {
 	int r = 0;
 	xcache_handler h;
+	struct xcache_entry *ce = NULL;
 
 	xlock_acquire(&cache->lock, 1);
 
 	h = __xcache_lookup_entries(cache, name);
-	if (h != NoEntry){
+	if (h != NoEntry)
+		ce = &cache->nodes[h];
+
+	if (h != NoEntry && ce->state != NODE_INVALIDATED){
+		ce->state = NODE_INVALIDATED;
 		r = __xcache_remove_entries(cache, h);
 		goto out_put;
 	}
@@ -1008,7 +1014,11 @@ int xcache_invalidate(struct xcache *cache, char *name)
 		xlock_release(&cache->lock);
 
 		h = __xcache_lookup_rm(cache, name);
-		if (h != NoEntry){
+		if (h != NoEntry)
+			ce = &cache->nodes[h];
+
+		if (h != NoEntry && ce->state != NODE_INVALIDATED){
+			ce->state = NODE_INVALIDATED;
 			r = __xcache_remove_rm(cache, h);
 		}
 
@@ -1064,6 +1074,7 @@ void xcache_free_new(struct xcache *cache, xcache_handler h)
 	ce->ref = 0;
 	free_cache_entry(cache, idx);
 }
+
 /*
  * Put all cache entries.
  * Does not free cache resources.
@@ -1073,11 +1084,11 @@ void xcache_close(struct xcache *cache)
 {
 	uint32_t i;
 	struct xcache_entry *ce;
+
 	for (i = 0; i < cache->nr_nodes; i++) {
 		ce = &cache->nodes[i];
 		if (!ce->ref)
 			continue;
-		xcache_invalidate(cache, ce->name);
 		xcache_entry_put(cache, i);
 	}
 }
