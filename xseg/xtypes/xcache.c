@@ -62,6 +62,9 @@ static void __free_cache_entry(struct xcache *cache, xqindex idx)
 
 static xqindex __get_idx(struct xcache *cache, struct xcache_entry *ce)
 {
+	if (!ce)
+		return Noneidx;
+
 	return (ce - cache->nodes);
 }
 
@@ -72,6 +75,9 @@ static xqindex __pop_lru(struct xcache *cache)
 
 	/* Get LRU from cache */
 	lru = __get_idx(cache, cache->lru);
+	if (lru == Noneidx)
+		return lru;
+
 	ce = cache->lru;
 
 	/* Special care is needed for the last item */
@@ -598,7 +604,7 @@ static xcache_handler __xcache_evict_lru(struct xcache *cache)
 	xcache_handler lru;
 
 	lru = __xcache_lru(cache);
-	if (lru == NoEntry)
+	if (lru == Noneidx)
 		return NoEntry;
 
 	r = __xcache_evict(cache, lru);
