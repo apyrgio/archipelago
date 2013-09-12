@@ -1368,6 +1368,61 @@ int test4(unsigned long cache_size, unsigned long nr_threads)
 	return 0;
 }
 
+int test5(unsigned long n)
+{
+	struct xcache cache;
+	struct xcache_ops c_ops = {
+		.on_init = NULL,
+		.on_evict = NULL,
+		.on_free = free_safe,
+		.on_node_init = NULL,
+		.on_put = put_safe
+	};
+	xcache_handler h, nh;
+	sum_put = 0;
+	sum_free = 0;
+	char name[XSEG_MAX_TARGETLEN + 1];
+	unsigned long i;
+
+	xcache_init(&cache, n, &c_ops, lru | XCACHE_USE_RMTABLE, NULL);
+	n = cache.size;
+
+	for (i = 0; i < n; i++) {
+		sprintf(name, "%lu", i);
+		h = xcache_lookup(&cache, name);
+		if (h != NoEntry){
+			fprintf(stderr, "Cache return cache entry\n");
+			return -1;
+		}
+
+		h = xcache_alloc_init(&cache, name);
+		if (h == NoEntry){
+			fprintf(stderr, "Could not allocate cache entry\n");
+			return -1;
+		}
+		nh = xcache_insert(&cache, h);
+		if (nh == NoEntry){
+			fprintf(stderr, "Could not insert cache entry\n");
+			return -1;
+		} else if (nh != h) {
+			xcache_free_new(&cache, h);
+		}
+	}
+
+	do {
+		h = xcache_evict_lru(&cache);
+	} while (h != NoEntry);
+
+	xcache_close(&cache);
+	if (sum_put != n || sum_free != n){
+		fprintf(stderr, "Sum_free:%lu puts instead of %lu\n"
+				"sum_put:%lu puts instead of %lu\n",
+				sum_free, n, sum_put, n);
+		return -1;
+	}
+	return 0;
+}
+
 void usage()
 {
 	fprintf(stdout,
@@ -1479,5 +1534,19 @@ rmtable:
 	fprintf(stderr, "Test 4: PASSED\n");
 	timersub(&end, &start, &tv);
 	fprintf(stderr, "Test time: %ds %dusec\n\n", (int)tv.tv_sec, (int)tv.tv_usec);
+
+	XSEGLOG("Starting new test\n");
+	fprintf(stderr, "Running Test 5\n");
+	gettimeofday(&start, NULL);
+	r = test5(cache_size);
+	if (r < 0){
+		fprintf(stderr, "Test 5: failed\n");
+		return -1;
+	}
+	gettimeofday(&end, NULL);
+	fprintf(stderr, "Test 5: PASSED\n");
+	timersub(&end, &start, &tv);
+	fprintf(stderr, "Test time: %ds %dusec\n\n", (int)tv.tv_sec, (int)tv.tv_usec);
+
 	return 0;
 }
