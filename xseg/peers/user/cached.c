@@ -2632,6 +2632,7 @@ static int custom_cached_loop(void *arg)
 	struct cached *cached = __get_cached(peer);
 	volatile uint64_t *gbdc = cached->bucket_data_status_counters;
 	struct xworkq *bworkq = &cached->bucket_workq;
+	xcache_handler h;
 
 	XSEGLOG2(&lc, I, "%s has tid %u.\n", id, pid);
 	xseg_init_local_signal(xseg, peer->portno_start);
@@ -2640,9 +2641,10 @@ static int custom_cached_loop(void *arg)
 #endif
 	while (!CAN_LEAVE(peer, gbdc)) {
 
-		while (isTerminate() && gbdc[DIRTY]) {
-			if (xcache_evict_lru(cached->cache) != NoEntry)
-				break;
+		if (isTerminate()) {
+			do {
+				h = xcache_evict_lru(cached->cache);
+			} while (h != NoEntry);
 		}
 
 		//Heart of peerd_loop. This loop is common for everyone.
