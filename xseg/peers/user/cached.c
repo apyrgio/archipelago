@@ -58,7 +58,8 @@
  */
 #define CAN_LEAVE(__peer, __gbdc)				\
 	(isTerminate() && all_peer_reqs_free(__peer) &&		\
-	 !__gbdc[DIRTY] && !__gbdc[LOADING] && !__gbdc[WRITING])
+	 !__gbdc[DIRTY] && !__gbdc[LOADING] && 			\
+	 !__gbdc[WRITING] && !__gbdc[VALID])
 
 /*
  * Helper functions
@@ -2679,8 +2680,10 @@ static int custom_cached_loop(void *arg)
 		}
 
 		/* Add this check here in order not to sleep for no reason */
-		if (CAN_LEAVE(peer, gbdc))
+		if (CAN_LEAVE(peer, gbdc)) {
+			xseg_cancel_wait(xseg, peer->portno_start);
 			break;
+		}
 
 		XSEGLOG2(&lc, I, "%s goes to sleep\n", id);
 		xseg_wait_signal(xseg, 10000000UL);
@@ -2950,7 +2953,6 @@ void custom_peer_finalize(struct peerd *peer)
 
 	xcache_close(cached->cache);
 	xcache_free(cached->cache);
-	return;
 }
 
 void custom_peer_usage()
