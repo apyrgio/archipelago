@@ -975,16 +975,17 @@ xcache_handler xcache_evict_lru(struct xcache *cache)
 
 xcache_handler xcache_peek_and_get_lru(struct xcache *cache)
 {
-	xcache_handler lru;
+	xcache_handler lru = NoEntry;
 
 	xlock_acquire(&cache->lock, 1);
 	if (cache->lru == NULL)
-		return NoEntry;
+		goto out;
 
 	lru = __get_idx(cache, cache->lru);
 	__xcache_entry_get(cache, lru);
-	xlock_release(&cache->lock);
 
+out:
+	xlock_release(&cache->lock);
 	return lru;
 }
 
