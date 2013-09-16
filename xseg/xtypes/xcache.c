@@ -373,7 +373,7 @@ static int __xcache_remove_rm(struct xcache *cache, xcache_handler h)
 
 	r = __table_remove(cache->rm_entries, ce->name);
 	if (UNLIKELY(r < 0)) {
-		XSEGLOG("Couldn't delete cache entry from hash table:\n"
+		XSEGLOG("BUG: Couldn't delete cache entry from hash table:\n"
 				"h: %llu, name: %s, cache->nodes[h].priv: %p, ref: %llu",
 				h, ce->name, cache->nodes[idx].priv, cache->nodes[idx].ref);
 	}
@@ -558,44 +558,46 @@ static xqindex __xcache_lru(struct xcache *cache)
 
 static int __xcache_evict(struct xcache *cache, xcache_handler h)
 {
-	//pre_evict
-	//remove from entries
-	//post_evict
-	//insert to rm_entries
-
 	struct xcache_entry *ce;
 	int r;
 
+	ce = &cache->nodes[h];
+
+	/* Make a sanity check */
+	if (UNLIKELY(ce->state == NODE_EVICTED))
+		XSEGLOG("BUG: Evicting an already evicted entry "
+				"(h: %lu, priv: %p)", h, ce->priv);
+
+	/* Check first if the entry can be insterted in the rm_table */
+	if (cache->flags & XCACHE_USE_RMTABLE) {
+		xlock_acquire(&cache->rm_lock, 1);
+		r = __xcache_insert_rm(cache, h);
+		xlock_release(&cache->rm_lock);
+
+		/*
+		 * It is not a major error if the entry can't be inserted,
+		 * since there may have been a lot of evictions. Fail silently.
+		 */
+		if (r < 0)
+			return -1;
+	}
+
+	/* Remove entry from entries table */
 	r = __xcache_remove_entries(cache, h);
 	if (r < 0) {
 		XSEGLOG("Failed to evict %llu from entries", h);
+
+		/* Undo the previous insertion */
+		if (cache->flags & XCACHE_USE_RMTABLE) {
+			xlock_acquire(&cache->rm_lock, 1);
+			r = __xcache_remove_rm(cache, h);
+			xlock_release(&cache->rm_lock);
+		}
+
 		return -1;
 	}
-
-	/*
-	if (NoPendingActions)
-		return 0;
-	*/
-	ce = &cache->nodes[h];
-
-	if (UNLIKELY(ce->state == NODE_EVICTED))
-		XSEGLOG("BUG: Evicting an already evicted entry (h: %lu, priv: %p)",
-			 h, ce->priv);
-
-	if (!(cache->flags & XCACHE_USE_RMTABLE))
-		return 0;
 
 	ce->state = NODE_EVICTED;
-	xlock_acquire(&cache->rm_lock, 1);
-	r = __xcache_insert_rm(cache, h);
-	xlock_release(&cache->rm_lock);
-
-	if (r < 0) {
-		ce->state = NODE_ACTIVE;
-		XSEGLOG("BUG: Failed insert %llu to rm_entries", h);
-		return -1;
-	}
-
 	return 0;
 }
 
@@ -609,8 +611,15 @@ static xcache_handler __xcache_evict_lru(struct xcache *cache)
 		return NoEntry;
 
 	r = __xcache_evict(cache, lru);
-	if (r < 0)
+	/*
+	 * Reinsert the entry in order to retry later on. This is not the best
+	 * way, but this scenario will only happen when the cache is
+	 * finalizing.
+	 */
+	if (r < 0) {
+		__update_access_time(cache, (xqindex)lru);
 		return NoEntry;
+	}
 	return lru;
 }
 
@@ -667,7 +676,7 @@ static xcache_handler __xcache_insert(struct xcache *cache, xcache_handler h,
 		/* if so then remove it from rm table */
 		r = __xcache_remove_rm(cache, tmp_h);
 		if (UNLIKELY(r < 0)) {
-			XSEGLOG("Could not remove found entry (%llu) for %s"
+			XSEGLOG("BUG: Could not remove found entry (%llu) for %s"
 				"from rm_entries", tmp_h, ce->name);
 			xlock_release(&cache->rm_lock);
 			return NoEntry;
