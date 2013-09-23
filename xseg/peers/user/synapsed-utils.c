@@ -361,7 +361,7 @@ ssize_t recv_data(int fd, struct synapsed_header *sh, char *target, char *data)
 
 		partial = readv(fd, iov + i, iovcnt - i);
 		if (partial == 0)
-			return 0;	/* Connection closed? */
+			return -2;	/* Connection closed? */
 		if (partial < 0) {
 			if (errno == EINTR || errno == EAGAIN) {
 				partial = 0;
@@ -435,6 +435,8 @@ int connect_to_remote(struct synapsed *syn, struct sockaddr_in *raddr_in)
 	int sockflags;
 	int r;
 
+	XSEGLOG2(&lc, D, "Started");
+
 	sockfd = lookup_sockfds(syn->cfd, raddr_in);
 	if (sockfd >= 0) {
 		XSEGLOG2(&lc, I, "Connection has already been established");
@@ -456,6 +458,7 @@ int connect_to_remote(struct synapsed *syn, struct sockaddr_in *raddr_in)
 	}
 
 	/* ...iterate all possible results */
+	XSEGLOG2(&lc, D, "Connecting to %s:%s", raddr, rport);
 	for (p = reminfo; p != NULL; p = p->ai_next) {
 		/* ...create a socket */
 		sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);

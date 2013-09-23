@@ -79,13 +79,13 @@ void custom_peer_usage()
 int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 {
 	struct synapsed *syn;
-	struct addrinfo hints, *hostinfo, *p;
+	struct addrinfo hints, *remoteinfo, *hostinfo, *p;
 	struct original_request *orig_req;
 	char host_port[MAX_PORT_LEN + 1];
 	char ra[MAX_ADDR_LEN + 1];
 	unsigned long rp = -1;
 	unsigned long txp = -1;
-	int sockfd;
+	int sockfd = -1;
 	int sockflags;
 	int optval = 1;
 	int i, r;
@@ -155,11 +155,19 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 		XSEGLOG2(&lc, E, "Remote address must be provided");
 		goto fail;
 	}
-	r = inet_pton(AF_INET, ra, &syn->raddr_in.sin_addr);
-	if (r == 0) {
-		XSEGLOG2(&lc, E, "-ra %s: Remote address is invalid", ra);
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+
+	r = getaddrinfo(ra, NULL, &hints, &remoteinfo);
+	if (r != 0) {
+		XSEGLOG2(&lc, E, "getaddrinfo: %s\n", gai_strerror(r));
 		goto fail;
 	}
+
+	memcpy(&syn->raddr_in, remoteinfo->ai_addr, sizeof(struct sockaddr_in));
+	freeaddrinfo(remoteinfo);
 
 	/* The remote port can be set either by user or to default */
 	if (rp == -1)
@@ -172,6 +180,7 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 		XSEGLOG2(&lc, E, "Target xseg port must be provided");
 		goto fail;
 	}
+	syn->txp = txp;
 
 	/*********************************\
 	 * Create a TCP listening socket *
@@ -265,6 +274,8 @@ syn_fail:
 
 void custom_peer_finalize(struct peerd *peer)
 {
+	struct synapsed *syn = __get_synapsed(peer);
+	close(syn->sockfd);
 }
 
 /*************************\
@@ -289,8 +300,10 @@ static int handle_accept(struct peerd *peer, struct peer_req *pr,
 
 	/* The remote address is hardcoded in the synapsed struct for now */
 	fd = connect_to_remote(syn, &syn->raddr_in);
-	if (fd < 0)
+	if (fd < 0) {
+		XSEGLOG2(&lc, E, "Cannot connect to remote");
 		return -1;
+	}
 
 	req_data = xseg_get_data(peer->xseg, req);
 	req_target = xseg_get_target(peer->xseg, req);
@@ -419,7 +432,7 @@ static int handle_recv(struct synapsed *syn, int fd)
 
 		XSEGLOG2(&lc, D, "Scattering rest of data");
 		bytes = recv_data(fd, &sh, req_target, req_data);
-		if (bytes <= 0)
+		if (bytes < 0)
 			goto reply_fail;
 		XSEGLOG2(&lc, D, "%lu bytes were transfered", bytes);
 
@@ -448,12 +461,13 @@ static int handle_recv(struct synapsed *syn, int fd)
 				sh.targetlen, sh.datalen);
 		goto put_xseg_request;
 	}
+	req->size = req->datalen;
 
 	XSEGLOG2(&lc, D, "Scattering data");
 	req_data = xseg_get_data(peer->xseg, req);
 	req_target = xseg_get_target(peer->xseg, req);
 	bytes = recv_data(fd, &sh, req_target, req_data);
-	if (bytes <= 0)
+	if (bytes < 0)
 		goto accept_fail;
 	XSEGLOG2(&lc, D, "%lu bytes were transfered for target %s", bytes, req_target);
 
@@ -480,7 +494,7 @@ static int handle_recv(struct synapsed *syn, int fd)
 
 	p = xseg_submit(xseg, req, srcport, X_ALLOC);
 	if (p == NoPort) {
-		XSEGLOG2(&lc, W, "Cannot submit request\n");
+		XSEGLOG2(&lc, W, "Cannot submit request to port %lu\n", dstport);
 		goto put_peer_request;
 	}
 
