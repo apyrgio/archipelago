@@ -828,6 +828,29 @@ put_xseg_request:
 	return -1;
 }
 
+/*
+ * Insertion/eviction process with writeback policy:
+ *
+ * Insertion removes an LRU entry from cache.
+ * After all pending operations on this entry have finished, on_evict is called.
+ *
+ * If cache entry is invalidated then we have no flushing to do.
+ * Else we check if there are any dirty buckets. If there are, we issue an
+ * explicit cache flush and mark the cache entry as evicted.
+ *
+ * The cache flush is serialized on the object work queue. New operations
+ * derived from reinsertions pose no threat since in this case, the eviction is
+ * being treated as a usual cache flush. Writeback can also take place safely
+ * during the flush.
+ *
+ * When eviction has finished, it marks the cache entry as ready and signals the
+ * deferred_workq for any jobs that waited during the flush.
+ * If writeback has occurred during eviction, the last put will check again if
+ * dirty buckets exist and if needed it will issue a new flush.
+ */
+void flush_work(void *wq, void *arg);
+static void reenter_flush_work(void *q, void *arg);
+
 //WORK
 static void flush_dirty_buckets(struct cached *cached, struct peer_req *pr)
 {
@@ -836,10 +859,25 @@ static void flush_dirty_buckets(struct cached *cached, struct peer_req *pr)
 	struct ce *ce = xcache_get_entry(cached->cache, cio->h);
 	struct bucket *b;
 	struct xwaitq *bwaitq = &cached->bucket_waitq;
+	struct xwaitq *rwaitq = &cached->req_waitq;
 	uint32_t *bdc = ce->bucket_data_status_counters;
 	uint32_t end = cached->buckets_per_object - 1;
 	uint32_t i, r, first_dirty, last_dirty;
 	int data_status, alloc_status;
+
+	/*
+	 * Do not start flushing if we know that other flushers are
+	 * out of requests.
+	 */
+	if (!req_pool_not_empty(peer)) {
+		XSEGLOG2(&lc, W, "Waiting preemptively for %p (h: %lu)",
+				ce, cio->h);
+		cio->work.job_fn = reenter_flush_work;
+		cio->work.job = pr;
+		ce->status = CE_READY;
+		xwaitq_enqueue(rwaitq, &cio->work);
+		return;
+	}
 
 	/* write all dirty buckets */
 	for (i = 0; i <= end && bdc[DIRTY]; i++) {
@@ -873,9 +911,10 @@ static void flush_dirty_buckets(struct cached *cached, struct peer_req *pr)
 						"sent though");
 				return;
 			}
-			cio->work.job_fn = put_ce;
-			cio->work.job = (void *)pr;
-			xwaitq_enqueue(&cached->req_waitq, &cio->work);
+			cio->work.job_fn = reenter_flush_work;
+			cio->work.job = pr;
+			ce->status = CE_READY;
+			xwaitq_enqueue(rwaitq, &cio->work);
 			return;
 		}
 		__set_bucket_data_status_range(ce, first_dirty, last_dirty, WRITING);
@@ -893,28 +932,6 @@ static void flush_dirty_buckets(struct cached *cached, struct peer_req *pr)
 		}
 	}
 }
-
-/*
- * Insertion/eviction process with writeback policy:
- *
- * Insertion removes an LRU entry from cache.
- * After all pending operations on this entry have finished, on_evict is called.
- *
- * If cache entry is invalidated then we have no flushing to do.
- * Else we check if there are any dirty buckets. If there are, we issue an
- * explicit cache flush and mark the cache entry as evicted.
- *
- * The cache flush is serialized on the object work queue. New operations
- * derived from reinsertions pose no threat since in this case, the eviction is
- * being treated as a usual cache flush. Writeback can also take place safely
- * during the flush.
- *
- * When eviction has finished, it marks the cache entry as ready and signals the
- * deferred_workq for any jobs that waited during the flush.
- * If writeback has occurred during eviction, the last put will check again if
- * dirty buckets exist and if needed it will issue a new flush.
- */
-void flush_work(void *wq, void *arg);
 
 static void reenter_flush_work(void *q, void *arg)
 {
