@@ -2932,8 +2932,17 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 	xwaitq_init(&cached->req_waitq, req_pool_not_empty,
 			peer, XWAIT_SIGNAL_ONE);
 
-	xseg_set_max_requests(peer->xseg, peer->portno_start, 10000);
-	xseg_set_freequeue_size(peer->xseg, peer->portno_start, 10000, 0);
+	r = xseg_set_max_requests(peer->xseg, peer->portno_start, 10000);
+	if (r < 0) {
+		XSEGLOG2(&lc, E, "Cannot increase max queue size (%d)", r);
+		goto fail;
+	}
+
+	r = xseg_set_freequeue_size(peer->xseg, peer->portno_start, 10000, 0);
+	if (r < 0) {
+		XSEGLOG2(&lc, E, "Cannot increase free queue size (%d)", r);
+		goto fail;
+	}
 
 	peer->peerd_loop = custom_cached_loop;
 
