@@ -644,6 +644,7 @@ uint64_t str2num(char *str)
 	return num;
 }
 
+__attribute__ ((unused))
 static void put_ce(void *q, void *arg)
 {
 	struct peer_req *pr = (struct peer_req *)arg;
