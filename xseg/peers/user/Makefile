@@ -36,7 +36,7 @@
 
 include $(XSEG_HOME)/base.mk
 #PEERS := xseg archip-sosd archip-mapperd archip-vlmcd archip-filed archip-bench
-PEERS := xseg archip-sosd archip-mapperd archip-vlmcd archip-filed archip-bench archip-dummy
+PEERS := xseg archip-sosd archip-glusterd archip-mapperd archip-vlmcd archip-filed archip-bench archip-dummy
 
 FILES="Makefile"
 FILES+=$(shell ls *.h)
@@ -79,6 +79,9 @@ xseg: xseg-tool.c $(BASE)/xtypes/xheap.c $(BASE)/xseg/xseg.h
 archip-sosd: mt-sosd.c hash.c hash.h peer.c peer.h
 	$(CC) $(CFLAGS) -o $@ $(CPREQS) $(INC) -L$(LIB) -lxseg -lrados -lpthread \
 							-lcrypto -DMT
+archip-glusterd: glusterd.c hash.c hash.h peer.c peer.h
+	$(CC) $(CFLAGS) -o $@ $(CPREQS) $(INC) -L$(LIB) -lxseg -lgfapi -lpthread \
+							-DMT
 archip-dummy: dummy.c peer.c peer.h
 	$(CC) $(CFLAGS) -o $@ $< peer.c $(INC) -L$(LIB) -lxseg -lpthread -DMT
 
@@ -120,4 +123,4 @@ install-src:
 clean:
 	rm -f xseg sosd vlmcd mapperd archip-sosd monitor archip-mapperd \
 		pfiled vlmc-xseg archip-vlmcd archip-filed archip-bench \
-		archip-dummy
+		archip-dummy archip-glusterd
