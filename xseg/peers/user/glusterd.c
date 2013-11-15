@@ -1170,7 +1170,7 @@ int handle_acquire(struct peerd *peer, struct peer_req *pr)
 		XSEGLOG2(&lc, E, "Lock op failed for %s", gio->obj_name);
 		fail(peer, pr);
 	} else {
-		XSEGLOG2(&lc, I, "Lock op succeededfor %s", gio->obj_name);
+		XSEGLOG2(&lc, I, "Lock op succeeded for %s", gio->obj_name);
 		complete(peer, pr);
 	}
 	return 0;

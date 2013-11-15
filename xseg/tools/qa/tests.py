@@ -33,7 +33,7 @@
 
 import archipelago
 from archipelago.common import Xseg_ctx, Request, Filed, Mapperd, Vlmcd, Sosd, \
-        Error, Segment
+        Error, Segment, Glusterd
 from archipelago.archipelago import start_peer, stop_peer
 import random as rnd
 import unittest2 as unittest
@@ -144,6 +144,7 @@ class XsegTest(unittest.TestCase):
             self.segment.destroy()
             self.segment.create()
         self.xseg = Xseg_ctx(self.segment, self.myport)
+
 
     def tearDown(self):
         if self.xseg:
@@ -471,6 +472,27 @@ class XsegTest(unittest.TestCase):
 
     def get_mapperd(self, args):
         return Mapperd(**args)
+
+    def get_glusterd(self, args, clean=False):
+        volume_name = args['volume']
+        server = args['server']
+        from gluster import gfapi
+
+        vol = gfapi.Volume(server, volume_name)
+        vol.mount()
+
+        # Unfortunately, libgfapi-python has no clean way to delete all volume
+        # files
+        vol.unlink("mytarget")
+        vol.unlink("copy_target")
+        vol.unlink("target_zeros")
+        vol.unlink("target_zeros_hash")
+        vol.unlink("mytarget_lock")
+        vol.unlink("mytarget_hash")
+
+        del vol
+
+        return Glusterd(**args)
 
     def get_vlmcd(self, args):
         return Vlmcd(**args)
@@ -1187,6 +1209,37 @@ class SosdTest(BlockerTest, XsegTest):
     def tearDown(self):
         stop_peer(self.blocker)
         super(SosdTest, self).tearDown()
+
+
+class GlusterdTest(BlockerTest, XsegTest):
+    filed_args = {
+            'role': 'testglusterd',
+            'spec': XsegTest.spec,
+            'nr_ops': 16,
+            'portno_start': 0,
+            'portno_end': 0,
+            'daemon': True,
+            'log_level': 3,
+            'nr_threads': 3,
+            'server' : "127.0.0.1",
+            'volume': 'gv0',
+            'async': 0,
+            }
+
+    def setUp(self):
+        super(GlusterdTest, self).setUp()
+        try:
+            self.blocker = self.get_glusterd(self.filed_args, clean=True)
+            self.blockerport = self.blocker.portno_start
+            start_peer(self.blocker)
+        except Exception as e:
+            super(GlusterdTest, self).tearDown()
+            raise e
+
+    def tearDown(self):
+        stop_peer(self.blocker)
+        super(GlusterdTest, self).tearDown()
+
 
 if __name__=='__main__':
     init()
