@@ -40,7 +40,6 @@
 #include <xseg/protocol.h>
 #include <glusterfs/api/glfs.h>
 #include <pthread.h>
-#include <openssl/sha.h>
 #include <ctype.h>
 #include <errno.h>
 #include <hash.h>
@@ -51,14 +50,7 @@
 #define HASH_SUFFIX "_hash"
 #define HASH_SUFFIX_LEN 5
 
-#define MAX_POOL_NAME 64
 #define MAX_OBJ_NAME (XSEG_MAX_TARGETLEN + LOCK_SUFFIX_LEN + 1)
-#define RADOS_LOCK_NAME "RadosLock"
-//#define RADOS_LOCK_COOKIE "Cookie"
-#define RADOS_LOCK_COOKIE "foo"
-#define RADOS_LOCK_TAG ""
-#define RADOS_LOCK_DESC ""
-
 #define MAX_GLFS_ARG_LEN 64
 
 void custom_peer_usage()
@@ -71,7 +63,7 @@ void custom_peer_usage()
 		"\n");
 }
 
-#define REQ_UNDEFINED -1
+#define REQ_UNDEFINED -2
 #define REQ_FAILED -1
 #define REQ_SUBMITTED 0
 #define REQ_COMPLETED 1
@@ -88,7 +80,6 @@ enum gluster_state {
 
 struct glusterd {
 	glfs_t *glfs;
-	//char volume[MAX_volume_NAME + 1];
 };
 
 struct gluster_io{
@@ -98,10 +89,6 @@ struct gluster_io{
 	uint64_t size;
 	char *second_name, *buf;
 	uint64_t read;
-	uint64_t watch_handle;
-	pthread_t tid;
-	pthread_cond_t cond;
-	pthread_mutex_t m;
 };
 
 static inline struct glusterd *__get_gluster(struct peerd *peer)
@@ -115,6 +102,7 @@ static inline int __set_glfs(struct glusterd *gluster, char *volume)
 
 	if (!gluster->glfs)
 		return -1;
+
 	return 0;
 }
 
@@ -123,13 +111,26 @@ static inline glfs_t *__get_glfs(struct glusterd *gluster)
 	return gluster->glfs;
 }
 
-static void gluster_complete_aio(struct glfs_fd *fd, ssize_t ret, void *data)
+int handle_read(struct peerd *peer, struct peer_req *pr);
+int handle_write(struct peerd *peer, struct peer_req *pr);
+
+
+static void gluster_complete_read(struct glfs_fd *fd, ssize_t ret, void *data)
 {
 	struct peer_req *pr = (struct peer_req*)data;
 	struct peerd *peer = pr->peer;
 
 	pr->retval = ret;
-	dispatch(peer, pr, pr->req, dispatch_internal);
+	handle_read(peer, pr);
+}
+
+static void gluster_complete_write(struct glfs_fd *fd, ssize_t ret, void *data)
+{
+	struct peer_req *pr = (struct peer_req*)data;
+	struct peerd *peer = pr->peer;
+
+	pr->retval = ret;
+	handle_write(peer, pr);
 }
 
 static void create_hash_name(struct peer_req *pr, char *hash_name)
@@ -214,11 +215,11 @@ static int do_aio_generic(struct peer_req *pr, uint32_t op,
 	switch (op) {
 	case X_READ:
 		r = glfs_pread_async(fd, buf, size, offset, 0,
-				gluster_complete_aio, pr);
+				gluster_complete_read, pr);
 		break;
 	case X_WRITE:
 		r = glfs_pwrite_async(fd, buf, size, offset, 0,
-				gluster_complete_aio, pr);
+				gluster_complete_write, pr);
 		break;
 	default:
 		return -1;
@@ -233,40 +234,10 @@ static int begin_aio_read(struct peer_req *pr, char *buf,
 	int r = 0;
 
 	r = do_aio_generic(pr, X_READ, buf, size, offset);
-	/* TODO: check errors */
-	return r;
-}
-
-static int complete_aio_read(struct peer_req *pr, char *buf,
-		uint64_t size, uint64_t offset, uint64_t *serviced)
-{
-	struct gluster_io *gio = (struct gluster_io *) pr->priv;
-	int r = 0;
-
-	if (pr->retval < 0) {
-		/* TODO: check errors */
-		return REQ_FAILED;
-	} else if (pr->retval == 0) {
-		XSEGLOG2(&lc, I, "Reading of %s reached end of file at "
-			"%lu bytes. Zeroing out rest",
-			gio->obj_name, *serviced);
-		memset(buf + *serviced, 0, size - *serviced);
-		*serviced = size;
-		return REQ_COMPLETED;
-	}
-
-	*serviced += pr->retval;
-
-	if (*serviced == size) {
-		return REQ_COMPLETED;
-	} else {
-		r = do_aio_generic(pr, X_READ, buf + *serviced,
-				size - *serviced, offset + *serviced);
-		/* TODO: check errors */
+	if (r >= 0)
 		return REQ_SUBMITTED;
-	}
-
-	return r;
+	else
+		return REQ_FAILED;
 }
 
 static int begin_aio_write(struct peer_req *pr, char *buf,
@@ -275,8 +246,42 @@ static int begin_aio_write(struct peer_req *pr, char *buf,
 	int r = 0;
 
 	r = do_aio_generic(pr, X_WRITE, buf, size, offset);
-	/* TODO: check errors */
-	return r;
+	if (r >= 0)
+		return REQ_SUBMITTED;
+	else
+		return REQ_FAILED;
+}
+
+static int complete_aio_read(struct peer_req *pr, char *buf,
+		uint64_t size, uint64_t offset, uint64_t *serviced)
+{
+	int r = 0;
+
+	/* Leave on fail or if there are no other data */
+	if (pr->retval < 0) {
+		/* TODO: check errors */
+		return REQ_FAILED;
+	} else if (pr->retval == 0) {
+		XSEGLOG2(&lc, I, "Zeroing rest of data");
+		memset(buf + *serviced, 0, size - *serviced);
+		*serviced = size;
+		return REQ_COMPLETED;
+	}
+
+	/*
+	 * Else, check if all data have been served and resubmit if necessary
+	 */
+	*serviced += pr->retval;
+	if (*serviced == size) {
+		return REQ_COMPLETED;
+	} else {
+		r = do_aio_generic(pr, X_READ, buf + *serviced,
+				size - *serviced, offset + *serviced);
+		if (r >= 0)
+			return REQ_SUBMITTED;
+		else
+			return REQ_FAILED;
+	}
 }
 
 static int complete_aio_write(struct peer_req *pr, char *buf,
@@ -284,26 +289,58 @@ static int complete_aio_write(struct peer_req *pr, char *buf,
 {
 	int r = 0;
 
+	/* Leave on fail or if there are no other data */
 	if (pr->retval < 0){
 		/* TODO: check errors */
 		return REQ_FAILED;
 	}
 
+	/*
+	 * Else, check if all data have been served and resubmit if necessary
+	 */
 	*serviced += pr->retval;
-
 	if (*serviced == size) {
 		return REQ_COMPLETED;
 	} else {
 		r = do_aio_generic(pr, X_WRITE, buf + *serviced,
 				size - *serviced, offset + *serviced);
-		/* TODO: check errors */
-		return REQ_SUBMITTED;
+		if (r >= 0)
+			return REQ_SUBMITTED;
+		else
+			return REQ_FAILED;
 	}
 
 	return r;
 }
 
-/* FIXME: Do we really need target or we can get away with pr as do_aio_write */
+static glfs_fd_t *do_block_create(struct peer_req *pr, char *target, int mode)
+{
+	struct peerd *peer = pr->peer;
+	struct glusterd *gluster = __get_gluster(peer);
+	glfs_t *glfs = __get_glfs(gluster);
+	glfs_fd_t *fd = NULL;
+
+	/*
+	 * Create the requested file (in O_EXCL mode if requested)
+	 * If errno is EINTR, retry. If it is other that EEXIST or EINTR,
+	 * leave.
+	 */
+	do {
+		errno = 0;
+		fd = glfs_creat(glfs, target,
+			O_WRONLY | O_CREAT | O_TRUNC | mode,
+			S_IRUSR | S_IWUSR);
+
+		if (errno != EEXIST && errno != EINTR) {
+			XSEGLOG2(&lc, E, "Unexpected error (errno %d) while "
+					"creating %s:", errno, target);
+			return fd;
+		}
+	} while (errno == EINTR);
+
+	return fd;
+}
+
 static glfs_fd_t *do_block_open(struct peer_req *pr, char *target, int mode)
 {
 	struct peerd *peer = pr->peer;
@@ -311,14 +348,32 @@ static glfs_fd_t *do_block_open(struct peer_req *pr, char *target, int mode)
 	glfs_t *glfs = __get_glfs(gluster);
 	glfs_fd_t *fd;
 
-	fd = glfs_open(glfs, target, O_RDWR);
-	if (!fd || !(mode & O_CREAT)) {
-		return fd;
-	}
+	/*
+	 * Open the requested file.
+	 * If errno is EINTR, retry. If it is other that ENOENT or EINTR,
+	 * leave.
+	 */
+	do {
+		errno = 0;
+		fd = glfs_open(glfs, target, O_RDWR);
 
-	fd = glfs_creat(glfs, target,
-		O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+		if (fd)
+			return fd;
+		if (errno != ENOENT && errno != EINTR) {
+			XSEGLOG2(&lc, E, "Unexpected error (errno %d) while "
+					"opening %s:", errno, target);
+			return fd;
+		}
+	} while (errno == EINTR);
 
+	if (!fd || !(mode & O_CREAT))
+		return NULL;
+
+	/*
+	 * Create the requested file only if user has demanded so.
+	 * If errno is EINTR, retry. Else, leave.
+	 */
+	fd = do_block_create(pr, target, 0);
 	return fd;
 }
 
@@ -329,34 +384,20 @@ static int do_block_close(struct peer_req *pr)
 	int r;
 
 	r = glfs_close(fd);
-	/* TODO: Error check */
+	if (r < 0)
+		XSEGLOG2(&lc, E, "Unexpected error (errno %d) while "
+				"closing fd %p:", errno, fd);
+
 	return r;
-}
-
-static glfs_fd_t *do_block_creat(struct peer_req *pr, char *target, int mode)
-{
-	struct peerd *peer = pr->peer;
-	struct glusterd *gluster = __get_gluster(peer);
-	glfs_t *glfs = __get_glfs(gluster);
-	glfs_fd_t *fd = NULL;
-
-	fd = glfs_creat(glfs, target,
-		O_WRONLY | O_CREAT | mode, S_IRUSR | S_IWUSR);
-	/* TODO: Error check */
-	return fd;
 }
 
 int do_block_lock(struct peer_req *pr, char *target, int mode)
 {
-	struct peerd *peer = pr->peer;
-	struct glusterd *gluster = __get_gluster(peer);
-	glfs_t *glfs = __get_glfs(gluster);
 	glfs_fd_t *fd = NULL;
 	int r;
 
 	do {
-		fd = glfs_creat(glfs, target,
-			O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
+		fd = do_block_create(pr, target, O_EXCL);
 
 		if (!fd && mode == XF_NOSYNC)
 			return -1;
@@ -375,97 +416,91 @@ int do_block_unlock(struct peer_req *pr, char *target, int mode)
 	struct glusterd *gluster = __get_gluster(peer);
 	glfs_t *glfs = __get_glfs(gluster);
 
-	/* Mode is currently only for breaking locks */
+	/* FIXME: Mode is currently only for breaking locks */
 	return glfs_unlink(glfs, target);
 }
 
-#if 0
+int do_block_stat(struct peer_req *pr, char *target, struct stat *buf)
+{
+	struct peerd *peer = pr->peer;
+	struct glusterd *gluster = __get_gluster(peer);
+	glfs_t *glfs = __get_glfs(gluster);
+
+	return glfs_stat(glfs, target, buf);
+}
+
+int do_block_delete(struct peer_req *pr, char *target)
+{
+	struct peerd *peer = pr->peer;
+	struct glusterd *gluster = __get_gluster(peer);
+	glfs_t *glfs = __get_glfs(gluster);
+
+	return glfs_unlink(glfs, target);
+}
+
 int handle_delete(struct peerd *peer, struct peer_req *pr)
 {
-	int r;
-	//struct glusterd *gluster = (struct glusterd *) peer->priv;
 	struct gluster_io *gio = (struct gluster_io *) pr->priv;
+	struct xseg_request *req = pr->req;
+	int r;
 
 	XSEGLOG2(&lc, D, "Started for pr %p, req %p, target %s",
 			pr, req, gio->obj_name);
 
-
-	if (gio->state == ACCEPTED) {
-		XSEGLOG2(&lc, I, "Deleting %s", gio->obj_name);
-		gio->state = PENDING;
-		r = do_aio_generic(peer, pr, X_DELETE, gio->obj_name, NULL, 0, 0);
-		if (r < 0) {
-			XSEGLOG2(&lc, E, "Deletion of %s failed", gio->obj_name);
-			fail(peer, pr);
-		}
-	}
-	else {
-		if (pr->retval < 0){
-			XSEGLOG2(&lc, E, "Deletion of %s failed", gio->obj_name);
-			fail(peer, pr);
-		}
-		else {
-			XSEGLOG2(&lc, I, "Deletion of %s completed", gio->obj_name);
-			complete(peer, pr);
-		}
+	r = do_block_delete(pr, gio->obj_name);
+	if (r < 0) {
+		XSEGLOG2(&lc, E, "Deletion of %s failed", gio->obj_name);
+		fail(peer, pr);
+	} else {
+		XSEGLOG2(&lc, I, "Deletion of %s completed", gio->obj_name);
+		complete(peer, pr);
 	}
 	return 0;
 }
 
 int handle_info(struct peerd *peer, struct peer_req *pr)
 {
-	int r;
-	struct xseg_request *req = pr->req;
-	//struct glusterd *gluster = (struct glusterd *) peer->priv;
 	struct gluster_io *gio = (struct gluster_io *) pr->priv;
-	char *req_data;
+	struct xseg_request *req = pr->req;
 	struct xseg_reply_info *xinfo;
+	struct stat stat;
+	char *req_data;
 	char buf[XSEG_MAX_TARGETLEN + 1];
-	char *target;
+	char *target = xseg_get_target(peer->xseg, req);
+	int r;
 
 	XSEGLOG2(&lc, D, "Started for pr %p, req %p, target %s",
 			pr, req, gio->obj_name);
 
-	if (gio->state == ACCEPTED) {
-		XSEGLOG2(&lc, I, "Getting info of %s", gio->obj_name);
-		gio->state = PENDING;
-		r = do_aio_generic(peer, pr, X_INFO, gio->obj_name, NULL, 0, 0);
+	if (req->datalen < sizeof(struct xseg_reply_info)) {
+		/* FIXME: Is this normal? */
+		strncpy(buf, target, req->targetlen);
+		r = xseg_resize_request(peer->xseg, req, req->targetlen,
+				sizeof(struct xseg_reply_info));
 		if (r < 0) {
-			XSEGLOG2(&lc, E, "Getting info of %s failed", gio->obj_name);	
+			XSEGLOG2(&lc, E, "Cannot resize request");
 			fail(peer, pr);
+			return -1;
 		}
+		target = xseg_get_target(peer->xseg, req);
+		strncpy(target, buf, req->targetlen);
 	}
-	else {
-		if (req->datalen < sizeof(struct xseg_reply_info)) {
-			target = xseg_get_target(peer->xseg, req);
-			strncpy(buf, target, req->targetlen);
-			r = xseg_resize_request(peer->xseg, req, req->targetlen, sizeof(struct xseg_reply_info));
-			if (r < 0) {
-				XSEGLOG2(&lc, E, "Cannot resize request");
-				fail(peer, pr);
-				return 0;
-			}
-			target = xseg_get_target(peer->xseg, req);
-			strncpy(target, buf, req->targetlen);
-		}
 
-		req_data = xseg_get_data(peer->xseg, req);
-		xinfo = (struct xseg_reply_info *)req_data;
-		if (pr->retval < 0){
-			xinfo->size = 0;
-			XSEGLOG2(&lc, E, "Getting info of %s failed", gio->obj_name);	
-			fail(peer, pr);
-		}
-		else {
-			xinfo->size = gio->size;
-			pr->retval = sizeof(uint64_t);
-			XSEGLOG2(&lc, I, "Getting info of %s completed", gio->obj_name);	
-			complete(peer, pr);
-		}
+	r = do_block_stat(pr, gio->obj_name, &stat);
+	if (r < 0) {
+		XSEGLOG2(&lc, E, "Stat failed for %s", gio->obj_name);
+		fail(peer, pr);
+		return -1;
 	}
+
+	req_data = xseg_get_data(peer->xseg, pr->req);
+	xinfo = (struct xseg_reply_info *)req_data;
+	xinfo->size = (uint64_t)stat.st_size;
+
+	XSEGLOG2(&lc, I, "Getting info of %s completed", gio->obj_name);
+	complete(peer, pr);
 	return 0;
 }
-#endif
 
 void handle_ping(struct peerd *peer, struct peer_req *pr)
 {
@@ -511,9 +546,9 @@ int handle_read(struct peerd *peer, struct peer_req *pr)
 		}
 		gio->fd = fd;
 
-		gio->state = READING;
-
 		XSEGLOG2(&lc, I, "Reading %s", target);
+
+		gio->state = READING;
 		ret = begin_aio_read(pr, data, req->size, req->offset);
 	} else if (gio->state == READING) {
 		XSEGLOG2(&lc, I, "Reading of %s callback", target);
@@ -524,7 +559,7 @@ int handle_read(struct peerd *peer, struct peer_req *pr)
 out:
 	switch (ret) {
 	case REQ_FAILED:
-		XSEGLOG2(&lc, I, "Reading of %s failed", target);
+		XSEGLOG2(&lc, E, "Reading of %s failed", target);
 		do_block_close(pr);
 		fail(peer, pr);
 		break;
@@ -579,8 +614,9 @@ int handle_write(struct peerd *peer, struct peer_req *pr)
 		}
 		gio->fd = fd;
 
-		gio->state = WRITING;
 		XSEGLOG2(&lc, I, "Writing %s", target);
+
+		gio->state = WRITING;
 		ret = begin_aio_write(pr, data, req->size, req->offset);
 	} else if (gio->state == WRITING) {
 		XSEGLOG2(&lc, I, "Writing of %s callback", target);
@@ -591,7 +627,7 @@ int handle_write(struct peerd *peer, struct peer_req *pr)
 out:
 	switch (ret) {
 	case REQ_FAILED:
-		XSEGLOG2(&lc, I, "Writing of %s failed", target);
+		XSEGLOG2(&lc, E, "Writing of %s failed", target);
 		do_block_close(pr);
 		fail(peer, pr);
 		break;
@@ -627,6 +663,7 @@ int handle_copy(struct peerd *peer, struct peer_req *pr)
 	if (gio->state == ACCEPTED) {
 		XSEGLOG2(&lc, I, "Copy of object %s to object %s started",
 				gio->second_name, gio->obj_name);
+
 		if (!req->size) {
 			ret = REQ_COMPLETED;
 			goto out;
@@ -634,7 +671,10 @@ int handle_copy(struct peerd *peer, struct peer_req *pr)
 
 		/* Create second name and buf */
 		r = prepare_copy(pr);
-		/* TODO: Check errors */
+		if (r < 0) {
+			ret = REQ_FAILED;
+			goto out;
+		}
 		target = gio->second_name;
 
 		/* FIXME: Will we fail here? */
@@ -648,15 +688,16 @@ int handle_copy(struct peerd *peer, struct peer_req *pr)
 		}
 		gio->fd = fd;
 
+		XSEGLOG2(&lc, I, "Reading %s", target);
+
 		gio->state = READING;
 		gio->read = 0;
-
-		XSEGLOG2(&lc, I, "Reading %s", target);
 		ret = begin_aio_read(pr, gio->buf, req->size, req->offset);
 	}
 	else if (gio->state == READING){
 		target = gio->second_name;
 		XSEGLOG2(&lc, I, "Reading of %s callback", target);
+
 		ret = complete_aio_read(pr, gio->buf, req->size,
 				req->offset, &gio->read);
 
@@ -665,9 +706,7 @@ int handle_copy(struct peerd *peer, struct peer_req *pr)
 
 		do_block_close(pr);
 write:
-		//do_aio_write
 		target = gio->obj_name;
-
 		fd = do_block_open(pr, target, O_CREAT);
 		if (!fd) {
 			XSEGLOG2(&lc, E, "Cannot open/create %s", target);
@@ -676,9 +715,9 @@ write:
 		}
 		gio->fd = fd;
 
-		gio->state = WRITING;
-
 		XSEGLOG2(&lc, I, "Writing %s", target);
+
+		gio->state = WRITING;
 		ret = begin_aio_write(pr, gio->buf, req->size, req->offset);
 	} else if (gio->state == WRITING) {
 		XSEGLOG2(&lc, I, "Writing of %s callback", target);
@@ -697,7 +736,7 @@ out:
 
 	switch (ret) {
 	case REQ_FAILED:
-		XSEGLOG2(&lc, I, "Copying of %s failed", target);
+		XSEGLOG2(&lc, E, "Copying of %s failed", target);
 		do_block_close(pr);
 		fail(peer, pr);
 		break;
@@ -744,6 +783,10 @@ int handle_hash(struct peerd *peer, struct peer_req *pr)
 
 		/* Create hash_name, gio second_name and gio->buf */
 		r = prepare_hash(pr, hash_name);
+		if (r < 0) {
+			ret = REQ_FAILED;
+			goto out;
+		}
 		target = hash_name;
 		gio->state = PREHASHING;
 
@@ -830,7 +873,7 @@ read:
 		 */
 		do_block_close(pr);
 
-		fd = do_block_creat(pr, gio->second_name, O_EXCL);
+		fd = do_block_create(pr, gio->second_name, O_EXCL);
 		if (!fd) {
 			XSEGLOG2(&lc, I, "Hash of object %s to object %s completed",
 					gio->obj_name, gio->second_name);
@@ -842,10 +885,10 @@ read:
 		gio->fd = fd;
 		target = gio->second_name;
 
-		gio->state = WRITING;
 		XSEGLOG2(&lc, I, "Writing %s", target);
-		ret = begin_aio_write(pr, gio->buf, req->size, req->offset);
 
+		gio->state = WRITING;
+		ret = begin_aio_write(pr, gio->buf, req->size, req->offset);
 	} else if (gio->state == WRITING) {
 		target = gio->second_name;
 		XSEGLOG2(&lc, I, "Writing of %s callback", target);
@@ -871,7 +914,7 @@ write:
 		hash_name[pos] = 0;
 
 		gio->state = POSTHASHING;
-		fd = do_block_creat(pr, hash_name, O_EXCL);
+		fd = do_block_create(pr, hash_name, O_EXCL);
 		if (!fd) {
 			XSEGLOG2(&lc, I, "Writing of prehashed value completed");
 			XSEGLOG2(&lc, I, "Hash of object %s to object %s completed",
@@ -911,7 +954,7 @@ out:
 
 	switch (ret) {
 	case REQ_FAILED:
-		XSEGLOG2(&lc, I, "Hashing of %s failed", target);
+		XSEGLOG2(&lc, E, "Hashing of %s failed", target);
 		do_block_close(pr);
 		fail(peer, pr);
 		break;
@@ -949,7 +992,7 @@ int handle_acquire(struct peerd *peer, struct peer_req *pr)
 		XSEGLOG2(&lc, E, "Lock op failed for %s", gio->obj_name);
 		fail(peer, pr);
 	} else {
-		XSEGLOG2(&lc, E, "Lock op succeededfor %s", gio->obj_name);
+		XSEGLOG2(&lc, I, "Lock op succeededfor %s", gio->obj_name);
 		complete(peer, pr);
 	}
 	return 0;
@@ -974,7 +1017,7 @@ int handle_release(struct peerd *peer, struct peer_req *pr)
 		XSEGLOG2(&lc, E, "Unlock op failed for %s", gio->obj_name);
 		fail(peer, pr);
 	} else {
-		XSEGLOG2(&lc, E, "Unlock op succeededfor %s", gio->obj_name);
+		XSEGLOG2(&lc, I, "Unlock op succeeded for %s", gio->obj_name);
 		complete(peer, pr);
 	}
 	return 0;
@@ -1041,25 +1084,6 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 		XSEGLOG2(&lc, E, "Error at glfs_init\n");
 		goto err_glfs;
 	}
-#if 0
-	fd = glfs_creat(glfs, filename,
-		O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
-	if (!fd) {
-		XSEGLOG2(&lc, E, "Error at glfs_creat\n");
-		goto out;
-	}
-
-        if (glfs_close(fd) != 0) {
-		XSEGLOG2(&lc, E, "Error at glfs_close");
-		goto out;
-	}
-
-	fd = glfs_open(glfs, filename, O_RDWR);
-	if (!fd) {
-		XSEGLOG2(&lc, E, "Error at glfs_open");
-		goto out;
-	}
-#endif
 
 	peer->priv = (void *)gluster;
 	for (i = 0; i < peer->nr_ops; i++) {
@@ -1073,9 +1097,6 @@ int custom_peer_init(struct peerd *peer, int argc, char *argv[])
 		gio->read = 0;
 		gio->size = 0;
 		gio->second_name = 0;
-		gio->watch_handle = 0;
-		pthread_cond_init(&gio->cond, NULL);
-		pthread_mutex_init(&gio->m, NULL);
 		peer->peer_reqs[i].priv = (void *) gio;
 	}
 	return 0;
@@ -1111,7 +1132,6 @@ int dispatch(struct peerd *peer, struct peer_req *pr, struct xseg_request *req,
 
 	strncpy(gio->obj_name, target, end);
 	gio->obj_name[end] = 0;
-	req->serviced = 0;
 
 	if (reason == dispatch_accept)
 		gio->state = ACCEPTED;
@@ -1123,7 +1143,6 @@ int dispatch(struct peerd *peer, struct peer_req *pr, struct xseg_request *req,
 		case X_WRITE:
 			handle_write(peer, pr);
 			break;
-#if 0
 		case X_DELETE:
 			if (canDefer(peer))
 				defer_request(peer, pr);
@@ -1142,18 +1161,15 @@ int dispatch(struct peerd *peer, struct peer_req *pr, struct xseg_request *req,
 			else
 				handle_copy(peer, pr);
 			break;
-#endif
 		case X_ACQUIRE:
 			handle_acquire(peer, pr);
 			break;
 		case X_RELEASE:
 			handle_release(peer, pr);
 			break;
-#if 0
 		case X_HASH:
 			handle_hash(peer, pr);
 			break;
-#endif
 		case X_PING:
 			handle_ping(peer, pr);
 			break;
