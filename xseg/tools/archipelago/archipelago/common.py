@@ -57,7 +57,8 @@ import random
 random.seed()
 hostname = socket.gethostname()
 
-valid_role_types = ['file_blocker', 'rados_blocker', 'mapperd', 'vlmcd']
+valid_role_types = ['file_blocker', 'rados_blocker', \
+        'gluster_blocker', 'mapperd', 'vlmcd']
 valid_segment_types = ['segdev', 'posix']
 
 peers = dict()
@@ -88,6 +89,7 @@ REQS = 512
 
 FILE_BLOCKER = 'archip-filed'
 RADOS_BLOCKER = 'archip-sosd'
+GLUSTER_BLOCKER = 'archip-glusterd'
 MAPPER = 'archip-mapperd'
 VLMC = 'archip-vlmcd'
 
@@ -273,6 +275,43 @@ class Sosd(MTpeer):
         if self.pool:
             self.cli_opts.append("--pool")
             self.cli_opts.append(self.pool)
+
+
+class Glusterd(MTpeer):
+    def __init__(self, transport="tcp", server=None, port="0",
+                volume=None, uniquestr=None, async=None, **kwargs):
+        self.executable = GLUSTER_BLOCKER
+        self.transport = transport
+        self.server = server
+        self.port = port
+        self.volume = volume
+        self.uniquestr = uniquestr
+        self.async = async
+        super(Glusterd, self).__init__(**kwargs)
+
+        if self.cli_opts is None:
+            self.cli_opts = []
+        self.set_glusterd_cli_options()
+
+    def set_glusterd_cli_options(self):
+        if self.transport:
+            self.cli_opts.append("--transport")
+            self.cli_opts.append(self.transport)
+        if self.server:
+            self.cli_opts.append("--server")
+            self.cli_opts.append(self.server)
+        if self.port:
+            self.cli_opts.append("--port")
+            self.cli_opts.append(str(self.port))
+        if self.volume:
+            self.cli_opts.append("--volume")
+            self.cli_opts.append(self.volume)
+        if self.uniquestr:
+            self.cli_opts.append("--uniquestr")
+            self.cli_opts.append(self.uniquestr)
+        if self.async:
+            self.cli_opts.append("--async")
+            self.cli_opts.append(str(self.async))
 
 
 class Filed(MTpeer):
@@ -530,6 +569,9 @@ def check_conf():
                                  prefix=ARCHIP_PREFIX, **role_config)
         elif role_type == 'rados_blocker':
             peers[role] = Sosd(role=role, spec=segment.get_spec(),
+                               **role_config)
+        elif role_type == 'gluster_blocker':
+            peers[role] = Glusterd(role=role, spec=segment.get_spec(),
                                **role_config)
         elif role_type == 'mapperd':
             peers[role] = Mapperd(role=role, spec=segment.get_spec(),
