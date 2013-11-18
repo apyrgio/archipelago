@@ -63,6 +63,7 @@ install: $(XSEG_INSTALL_TARGETS)
 	install -d $(DESTDIR)$(confdir)
 	install -o 0 -g 0 -m 644 -t $(DESTDIR)$(confdir) conf/archipelago.conf
 	install -o 0 -g 0 -m 644 -t $(DESTDIR)$(confdir) conf/archipelago.conf.rados_example
+	install -o 0 -g 0 -m 644 -t $(DESTDIR)$(confdir) conf/archipelago.conf.gluster_example
 
 install-src: $(XSEG_INSTALLSRC_TARGETS) $(XSEG_INSTALLSRC_DIRS)
 	install -d $(DESTDIR)$(srcdir)/lib
