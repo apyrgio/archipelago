@@ -22,12 +22,16 @@
 The script takes it's input from environment variables. Specifically the
 following variables should be present:
 
- - VOL_NAME: The name of the new Image file
+ - VOL_CNAME: The name of the new Image file
  - VOL_SIZE: The size of the new Image (in megabytes)
 
 The following variables are optional:
 
  - EXTP_ORIGIN: The name of the Image file to snapshot
+ - EXTP_REUSE_DATA: An indication to Archipelago that it should not create a
+   new volume but map an existing one
+ - EXTP_KEEP_DATA: An indication to Archipelgo that it should not delete the
+   volume's data
 
 The code branches to the correct function, depending on the name (sys.argv[0])
 of the executed script (attach, create, etc).
@@ -45,16 +49,21 @@ from archipelago import vlmc as vlmc
 
 def ReadEnv():
     """Read the enviromental variables"""
-    name = os.getenv("VOL_NAME")
+    name = os.getenv("VOL_CNAME")
     if name is None:
-        sys.stderr.write('The environment variable VOL_NAME is missing.\n')
+        sys.stderr.write('The environment variable VOL_CNAME is missing.\n')
         return None
+
+    reuse_data = os.getenv("EXTP_REUSE_DATA") == "True"
+    keep_data = os.getenv("EXTP_KEEP_DATA") == "True"
 
     return {"name": name,
             "size": os.getenv("VOL_SIZE"),
             "origin": os.getenv("EXTP_ORIGIN"),
             "origin_size": os.getenv("EXTP_ORIGIN_SIZE", "-1"),
             "snapshot_name": os.getenv("VOL_SNAPSHOT_NAME"),
+            "reuse_data": reuse_data,
+            "keep_data": keep_data,
             }
 
 
@@ -64,10 +73,15 @@ def create(env):
     size = env.get("size")
     origin = env.get("origin")
     origin_size = env.get("origin_size")
+    reuse_data = env.get("reuse_data")
+
     sys.stderr.write("Creating volume '%s' of size '%s' from '%s'\n"
                      % (name, size, origin))
-    vlmc.create(name=name, size=int(size), snap=origin, assume_v0=True,
-                v0_size=int(origin_size))
+
+    if not reuse_data:
+      sys.stderr.write('Creating volume.\n')
+      vlmc.create(name=name, size=int(size), snap=origin, assume_v0=True,
+                  v0_size=int(origin_size))
     return 0
 
 
@@ -139,11 +153,14 @@ def grow(env):
 
 
 def remove(env):
-    """Delete a vlmc Image"""
+    """Delete a vlmc Image
+    """
     name = env.get("name")
+    keep_data = env.get("keep_data")
 
-    sys.stderr.write("Deleting '%s'\n" % name)
-    vlmc.remove(name=name)
+    if not keep_data:
+      sys.stderr.write("Deleting '%s'\n" % name)
+      vlmc.remove(name=name)
     return 0
 
 
